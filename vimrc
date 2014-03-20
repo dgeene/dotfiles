@@ -1,29 +1,21 @@
 
-
+"load pathogen and bundles
 execute pathogen#infect()
 
-""""""""""""""""""""""
-"     General        "
-""""""""""""""""""""""
-set nocompatible
 
+set nocompatible                             "no need to be compatible with old vim
 map <C-n> :NERDTreeToggle<CR>
-
-"Automatic reload of .vimrc
-autocmd! bufwritepost .vimrc source %
+autocmd! bufwritepost .vimrc source %        "Automatic reload of .vimrc when saving
+filetype plugin indent on
 
 "better copy and paste
 set pastetoggle=<F2>
 set clipboard=unnamed
 
-""""""""""""""""""""""
-"     Events         "
-""""""""""""""""""""""
-filetype plugin indent on
 
 
 """"""""""""""""""""""
-"   Colors/Theme     " 
+"   Colors/Theme     "
 """"""""""""""""""""""
 
 "show trailing whitespace
@@ -33,7 +25,9 @@ au InsertLeave * match ExtraWhitespace /\s\+$/
 
 syntax enable "formerly syntax on
 set t_Co=256
-colorscheme monokai 
+colorscheme monokai
+
+
 
 """"""""""""""""""""""
 "      Vim UI        "
@@ -55,6 +49,6 @@ set mouse=a     "on OSX press ALT and Click
 set bs=2 "make backspace behave normally
 
 "easier moving of code blocks for better indentation
-vnoremap < <gv 
-vnoremap > >gv 
+vnoremap < <gv
+vnoremap > >gv
 
