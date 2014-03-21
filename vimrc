@@ -7,6 +7,9 @@ set nocompatible                             "no need to be compatible with old 
 map <C-n> :NERDTreeToggle<CR>
 autocmd! bufwritepost .vimrc source %        "Automatic reload of .vimrc when saving
 filetype plugin indent on
+set ts=2                                     "set indent to 2 spaces
+set shiftwidth=2                             "set number of space characters inserted for indentation
+set expandtab                                "use spaces, not tab characters
 
 "better copy and paste
 set pastetoggle=<F2>
