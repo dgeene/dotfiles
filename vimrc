@@ -55,7 +55,9 @@ call matchadd('ColorColumn', '\%80v', 100)
 "set nowrap "dont automatically wrap on load
 "set fo-=t "dont automatically wrap text while typing
 
-
+"ctrlp config
+let g:ctrlp_map = '<leader>f'
+let g:ctrlp_max_height = 30
 
 
 

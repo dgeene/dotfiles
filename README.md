@@ -14,7 +14,17 @@ vimrc examples from:https://www.youtube.com/watch?v=YhqsjUUHj6g
 After the repo has been cloned run:
 ```bash
 $ cd dotfiles
-$ git submodule init
-$ git submodule update 
+~/dotfiles$ git submodule init
+~/dotfiles$ git submodule update
 ```
-This will clone vim/bundle submodules
+This will clone vim/bundle submodules.
+Now symlink the config files to the root of the home directory.
+
+
+To add more vim plugins as submodules:
+Using ctrlp as an example,
+```bash
+~/dotfiles$ git submodule add https://github.com/kien/ctrlp.vim.git vim/bundle/ctrlp.vim
+~/dotfiles$ git commit -m "added ctrlp vim plugin"
+~/dotfiles$ git push
+```
