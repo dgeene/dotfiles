@@ -59,7 +59,8 @@ call matchadd('ColorColumn', '\%80v', 100)
 let g:ctrlp_map = '<leader>f'
 let g:ctrlp_max_height = 30
 
-
+"have vim insert the standard 4spaces for .py files
+"autocmd Filetype python setlocal expandtab tabstop=4 shiftwidth=4
 
 
 
