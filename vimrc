@@ -12,6 +12,7 @@ set shiftwidth=2                             "set number of space characters ins
 set expandtab                                "use spaces, not tab characters
 set number                                   "show line numbers and length
 let mapleader = ","                          "set leader key to comma instead of \
+let g:NERDTreeDirArrows=0                    "this sisables nertree's use of unicode charaters. search cannot enter child dir's
 
 "better copy and paste
 set pastetoggle=<F2>
