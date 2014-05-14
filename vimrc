@@ -12,7 +12,9 @@ set shiftwidth=4                             "set number of space characters ins
 set expandtab                                "use spaces, not tab characters
 set number                                   "show line numbers and length
 let mapleader = ","                          "set leader key to comma instead of \
-let g:NERDTreeDirArrows=0                    "this sisables nertree's use of unicode charaters. search cannot enter child dir's
+let g:NERDTreeDirArrows=0                    "this sisables nertree's use of unicode charaters for better compatability.
+set cursorline                               "highlight the current line
+
 
 "better copy and paste
 set pastetoggle=<F2>
@@ -32,6 +34,12 @@ imap <leader>" ""<ESC>i
 imap <leader>( ()<ESC>i
 imap <leader>[ []<ESC>i
 
+"autocenter things
+nmap G Gzz
+nmap n nzz
+nmap N Nzz
+nmap } }zz
+nmap { {zz
 
 
 
