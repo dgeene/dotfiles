@@ -26,6 +26,14 @@ vnoremap > >gv
 set mouse=a                                  "on OSX press ALT and Click
 set bs=2                                     "make backspace behave normally
 
+"quick pairs in insert mode
+imap <leader>' ''<ESC>i
+imap <leader>" ""<ESC>i
+imap <leader>( ()<ESC>i
+imap <leader>[ []<ESC>i
+
+
+
 
 
 """"""""""""""""""""""
@@ -64,4 +72,15 @@ let g:ctrlp_max_height = 30
 "autocmd Filetype python setlocal expandtab tabstop=4 shiftwidth=4
 
 
-
+"unmap bad habits (arrow keys).
+no <down> <Nop>
+no <left> <Nop>
+no <right> <Nop>
+no <up> <Nop>
+ino <down> <Nop>
+ino <left> <Nop>
+ino <right> <Nop>
+ino <up> <Nop>
+"add these later
+"no <down> ddp "move current line down
+"no <up> ddkP  "move current line up
