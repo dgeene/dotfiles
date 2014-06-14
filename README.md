@@ -28,3 +28,10 @@ Using ctrlp as an example,
 ~/dotfiles$ git commit -m "added ctrlp vim plugin"
 ~/dotfiles$ git push
 ```
+
+
+## Notes about TMUX
+Since tmux doesnt run in 256 mode by default it is best to force it using an alias in eith .bashrc or .profile.
+For whatever reason it is not enabled in .tmux.conf even though it is there.
+Put this line in either .bashrc or .profile or both:
+alias tmux="TERM=screen-256color-bce tmux"
