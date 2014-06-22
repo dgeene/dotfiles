@@ -57,6 +57,7 @@ au InsertLeave * match ExtraWhitespace /\s\+$/
 
 syntax enable "formerly syntax on
 set t_Co=256
+"set background=dark
 colorscheme monokai
 
 "highlight 80 char columns
