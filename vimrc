@@ -1,4 +1,6 @@
 
+"to disable a plugin, add its bundle name to the following list
+"let g:pathogen_disabled = []
 "load pathogen and bundles
 execute pathogen#infect()
 
@@ -75,6 +77,10 @@ call matchadd('ColorColumn', '\%80v', 100)
 "ctrlp config
 let g:ctrlp_map = '<leader>f'
 let g:ctrlp_max_height = 30
+
+"vim airline configs
+set laststatus=2
+
 
 "have vim insert the standard 4spaces for .py files
 "autocmd Filetype python setlocal expandtab tabstop=4 shiftwidth=4
