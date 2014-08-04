@@ -1,0 +1,16 @@
+[user]
+    name = David Geene
+	email = david.geene@gmail.com
+[core]
+	editor = vim
+[color]
+	ui = true
+
+#Use these aliases when ready
+#from: haacked.com/archive/2014/07/28/github-flow-aliases
+#
+#[alias]
+#checkout
+#   co = checkout
+#
+#
