@@ -16,6 +16,9 @@ set number                                   "show line numbers and length
 let mapleader = ","                          "set leader key to comma instead of \
 let g:NERDTreeDirArrows=0                    "this sisables nertree's use of unicode charaters for better compatability.
 set cursorline                               "highlight the current line
+set ignorecase                               "searches are case insensitive
+set smartcase                                " ... unless they have at lease one capital
+set wildmenu                                 "use tab completion on command line
 
 
 "better copy and paste
@@ -102,6 +105,6 @@ ino <down> <Nop>
 ino <left> <Nop>
 ino <right> <Nop>
 ino <up> <Nop>
-"add these later
-"no <down> ddp "move current line down
-"no <up> ddkP  "move current line up
+"move current line up or down
+no <down> ddp
+no <up> ddkP
