@@ -12,14 +12,19 @@ filetype plugin indent on
 set ts=4                                     "set indent to 4 spaces
 set shiftwidth=4                             "set number of space characters inserted for indentation
 set expandtab                                "use spaces, not tab characters
-set number                                   "show line numbers and length
 let mapleader = ","                          "set leader key to comma instead of \
 let g:NERDTreeDirArrows=0                    "this sisables nertree's use of unicode charaters for better compatability.
 set cursorline                               "highlight the current line
 set ignorecase                               "searches are case insensitive
 set smartcase                                " ... unless they have at lease one capital
 set wildmenu                                 "use tab completion on command line
+set history=300                              "remember more than 20 searches/commands
 
+"treat cursorline as line 0, helpful for motions
+if exists('+relativenumber')
+    set relativenumber
+end
+set number                                   "show line numbers and length
 
 "better copy and paste
 set pastetoggle=<F2>
@@ -52,6 +57,22 @@ nmap N Nzz
 nmap } }zz
 nmap { {zz
 
+"unmap bad habits (arrow keys).
+no <down> <Nop>
+no <left> <Nop>
+no <right> <Nop>
+no <up> <Nop>
+ino <down> <Nop>
+ino <left> <Nop>
+ino <right> <Nop>
+ino <up> <Nop>
+"move current line up or down
+no <down> ddp
+no <up> ddkP
+
+
+"insert ruby hash rocket, Ctrl-L
+imap <c-l> <space>=><space>
 
 
 
@@ -95,16 +116,21 @@ set laststatus=2
 "have vim insert the standard 4spaces for .py files
 "autocmd Filetype python setlocal expandtab tabstop=4 shiftwidth=4
 
+"delete trailing whitespace
+"http://wim.wikia.com/wiki/Remove_unwanted_spaces
+function! RD_RemoveTrailingSpaces()
+    " set mark to return to later
+    normal m`
+    " save user's search register
+    let _lastsearch=@/
+    " find any space/tab at ends of lines and remove
+    " the 'e' suppresses error if none found
+    %s/\s\+$//e
+    "restore search register
+    let @/=_lastsearch
+    " jump back to mark we set
+    normal ``
+    echo "removed trailing spaces (if any)"
+endfunction
+nmap <leader>tw :call RD_RemoveTrailingSpaces()<CR>
 
-"unmap bad habits (arrow keys).
-no <down> <Nop>
-no <left> <Nop>
-no <right> <Nop>
-no <up> <Nop>
-ino <down> <Nop>
-ino <left> <Nop>
-ino <right> <Nop>
-ino <up> <Nop>
-"move current line up or down
-no <down> ddp
-no <up> ddkP
