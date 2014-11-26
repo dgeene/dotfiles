@@ -26,6 +26,13 @@ if exists('+relativenumber')
 end
 set number                                   "show line numbers and length
 
+"prevent cursor from jumping when joining
+nnoremap J mzJ`z
+
+"I like splits this way
+set splitbelow
+set splitright
+
 "better copy and paste
 set pastetoggle=<F2>
 set clipboard=unnamed
@@ -56,6 +63,9 @@ nmap n nzz
 nmap N Nzz
 nmap } }zz
 nmap { {zz
+"some crazy voodoo ex: 20j - move 20 'real' lines up when wrapped
+"nnoremap <expr> k (v:count == 0 ? 'gk' : 'k')
+"nnoremap <expr> j (v:count == 0 ? 'gj' : 'j')
 
 "unmap bad habits (arrow keys).
 no <down> <Nop>
