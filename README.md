@@ -35,3 +35,11 @@ Since tmux doesnt run in 256 mode by default it is best to force it using an ali
 For whatever reason it is not enabled in .tmux.conf even though it is there.
 Put this line in either .bashrc or .profile or both:
 alias tmux="TERM=screen-256color-bce tmux"
+
+## Tmuxifier
+Define the custom layouts path for tmuxifier in .profile or .bashrc so we can sync our custom layouts.
+First make a symlink to `~/dotfiles/tmux-layouts` from `~/.tmux-layouts`
+Then in either .profile or .bash
+```bash
+export TMUXIFIER_LAYOUT_PATH="$HOME/.tmux-layouts"
+```
