@@ -1,7 +1,8 @@
 # A generic development environment
 # Set a custom session root path. Default is `$HOME`.
 # Must be called before `initialize_session`.
-#session_root "~/Projects/dev"
+# set session inside current working directory
+session_root $PWD
 
 # Create session with specified name if it does not already exist. If no
 # argument is given, session name will be based on layout file name.

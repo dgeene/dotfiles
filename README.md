@@ -43,3 +43,4 @@ Then in either .profile or .bash
 ```bash
 export TMUXIFIER_LAYOUT_PATH="$HOME/.tmux-layouts"
 ```
+Add an extra argument in .profile to force tmuxifier to start tmux in 256 color mode.
