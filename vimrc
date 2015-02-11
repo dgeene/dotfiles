@@ -21,9 +21,9 @@ set wildmenu                                 "use tab completion on command line
 set history=300                              "remember more than 20 searches/commands
 
 "treat cursorline as line 0, helpful for motions
-if exists('+relativenumber')
-    set relativenumber
-end
+"if exists('+relativenumber')
+"    set relativenumber
+"end
 set number                                   "show line numbers and length
 
 "prevent cursor from jumping when joining
