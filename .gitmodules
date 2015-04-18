@@ -34,3 +34,6 @@
 [submodule "vim/bundle/vim-vividchalk"]
 	path = vim/bundle/vim-vividchalk
 	url = https://github.com/tpope/vim-vividchalk.git
+[submodule "vim/bundle/Apprentice"]
+	path = vim/bundle/Apprentice
+	url = https://github.com/romainl/Apprentice.git
