@@ -14,7 +14,7 @@ set shiftwidth=4                             "set number of space characters ins
 set expandtab                                "use spaces, not tab characters
 let mapleader = ","                          "set leader key to comma instead of \
 let g:NERDTreeDirArrows=0                    "this sisables nertree's use of unicode charaters for better compatability.
-set cursorline                               "highlight the current line
+set cursorline                               "highlight the current line. Disable if scrolling becomes laggy
 set ignorecase                               "searches are case insensitive
 set smartcase                                " ... unless they have at lease one capital
 set wildmenu                                 "use tab completion on command line
@@ -29,7 +29,7 @@ set number                                   "show line numbers and length
 "prevent cursor from jumping when joining
 nnoremap J mzJ`z
 
-"I like splits this way
+" open new splits to the right an bottom. feels better
 set splitbelow
 set splitright
 

@@ -11,6 +11,8 @@ NOTE!!!: do not run makesymlinks.sh because it installs zsh and oh_my_zsh. I don
 
 vimrc examples from:https://www.youtube.com/watch?v=YhqsjUUHj6g
 
+
+## Git submodules
 After the repo has been cloned run:
 ```bash
 $ cd dotfiles
@@ -26,6 +28,10 @@ ln -s ~/dotfiles/vimrc ~/.vimrc
 
 
 To add more vim plugins as submodules:
+```bash
+~/dotfiles$ git submodule add <https://path/to/submodule/repo.git> <path/to/designated/directory>
+```
+
 Using ctrlp as an example,
 ```bash
 ~/dotfiles$ git submodule add https://github.com/kien/ctrlp.vim.git vim/bundle/ctrlp.vim
@@ -45,6 +51,10 @@ Define the custom layouts path for tmuxifier in .profile or .bashrc so we can sy
 First make a symlink to `~/.tmux-layouts` from `~/dotfiles/tmux-layouts`
 Then in either .profile or .bash
 ```bash
+eval "$(tmuxifier init -)"
 export TMUXIFIER_LAYOUT_PATH="$HOME/.tmux-layouts"
 ```
-Add an extra argument in .profile to force tmuxifier to start tmux in 256 color mode.
+Then on the next line we can pass args to tmux itself. In this case force tmux to start in 256 color mode.
+```bash
+export TMUXIFIER_TMUX_OPTS="-2"
+```
