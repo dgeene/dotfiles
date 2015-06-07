@@ -1,7 +1,12 @@
 dotfiles
 ========
-
 Dave's Dotfiles
+
+## Home Directory Setup
+~/bin - for compiled binaries. Usually from outside sources and that I do not want synced.
+~/bin/src - source files
+~/dotfiles - Where dotfiles that need to be synced to the cloud will live.
+~/dotfiles/scripts - Shellscripts and other utilities will live.
 
 
 Used the example from: http://blog.smalleycreative.com/tutorials/using-git-and-github-to-manage-your-dotfiles/

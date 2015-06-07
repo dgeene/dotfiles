@@ -11,3 +11,7 @@
 #   tmux-layouts
 #   tmux.conf
 #   bin
+#
+#
+# ideas for bashrc
+# 1. use an amber color for non-local bash sessions
