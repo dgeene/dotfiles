@@ -38,3 +38,4 @@ dirsize() {
 }
 
 # vi:syntax=sh
+# vim: set filetype=sh
