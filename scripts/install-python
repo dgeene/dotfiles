@@ -1,0 +1,88 @@
+#!/bin/bash
+# The intention of this script is to setup a python environment
+# that is local to a user so we can leave the system installed
+# python alone and work with virtualenvironments.
+# This script will:
+# Install dependencies for compiling
+# Install virtualenv + virtualenvwrapper to system python
+# Source virtualenvwrapper in bashrc
+# Export workon home variable
+# Compile python to ~/.localpythons
+
+
+if [ "$(id -u)" != "0" ]; then
+    echo "You must run this script with sudo"
+    exit 1
+fi
+
+# keep it simple and just get latest here
+PYTHON_VERSION="2.7.10"
+PYTHON_URL="http://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tgz"
+LOCAL_DIR="$HOME/.localpythons"
+VIRT_DIR="$HOME/.virtualenvs"
+
+main () {
+
+    # run apt update and get depending packages
+    echo "Installing dependencies...."
+    sleep 2
+    #apt-get update
+    #apt-get install -y build-essential python-dev libssl-dev zlib1g-dev libbz2-dev libreadline6-dev libsqlite3-dev libgdm-dev libmysqlclient-dev
+
+
+    echo "Creating directories..."
+    sleep 1
+    #[[ -d "$HOME/test" ]] || sudo -u $SUDO_USER mkdir "$HOME/test"
+    #[[ -d $LOCAL_DIR ]] || sudo -u $SUDO_USER mkdir $LOCAL_DIR
+    #[[ -d $VIRT_DIR ]] || sudo -u $SUDO_USER mkdir $VIRT_DIR
+
+    echo "Downloading python $PYTHON_VERSION...."
+    gzarchive=$(basename "$PYTHON_URL")
+    foldername=${gzarchive%.*}
+    #sudo -u $SUDO_USER wget -P /tmp $PYTHON_URL
+    if [ ! -f "/tmp/$gzarchive" ];
+    then
+        echo "oops. i was unable to download python, exiting."
+        exit 1
+    else
+        echo "Download Successful, extracting."
+        sudo -u $SUDO_USER tar -zxf "/tmp/$gzarchive" -C /tmp
+        cd "/tmp/$foldername"
+
+
+        echo "Starting compile process...."
+        echo "This will compile python into $LOCAL_DIR/$foldername"
+        sleep 1
+        sudo -u $SUDO_USER mkdir "$LOCAL_DIR/$foldername"
+        sudo -u $SUDO_USER ./configure --prefix="$LOCAL_DIR/$foldername"
+        sudo -u $SUDO_USER make
+        #sudo -u $SUDO_USER make install
+    fi
+    echo $PYTHON_URL
+    echo $SUDO_USER
+    echo $HOME
+}
+
+
+
+
+
+
+cat << EndOfMessage
+
+This script is designed to be run on a fresh system.
+It will compile and install python.
+
+Do you want to execute this script?
+EndOfMessage
+select yn in "Yes" "No"; do
+    case $yn in
+        Yes ) main; break;;
+        No ) exit;;
+    esac
+done
+
+
+#
+# vi:syntax=sh
+# vim: set filetype=sh

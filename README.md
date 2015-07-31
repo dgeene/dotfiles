@@ -50,6 +50,9 @@ Since tmux doesnt run in 256 mode by default it is best to force it using an ali
 For whatever reason it is not enabled in .tmux.conf even though it is there.
 Put this line in either .bashrc or .profile or both:
 alias tmux="TERM=screen-256color-bce tmux"
+Also if using putty or mtputty, enable utf-8 mode so we don't get funny characters to denote pane splits. To do that open
+the regular putty.exe go to Window > Translation > Remote character set. From the dropwdown select UTF-8. Save this session
+and you should be able to load it in mtputty.
 
 ## Tmuxifier
 Define the custom layouts path for tmuxifier in .profile or .bashrc so we can sync our custom layouts.
