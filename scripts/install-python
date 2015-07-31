@@ -23,23 +23,32 @@ VIRT_DIR="$HOME/.virtualenvs"
 
 main () {
 
+    # do the sudoey rooty stuff first
     # run apt update and get depending packages
     echo "Installing dependencies...."
     sleep 2
-    #apt-get update
-    #apt-get install -y build-essential python-dev libssl-dev zlib1g-dev libbz2-dev libreadline6-dev libsqlite3-dev libgdm-dev libmysqlclient-dev
+    apt-get update
+    apt-get install -y build-essential python-dev libssl-dev \
+			zlib1g-dev libbz2-dev libreadline6-dev \
+			libsqlite3-dev libgdm-dev libmysqlclient-dev \
+			python-pip
 
+    pip install virtualenv virtualenvwrapper
+    #fixme
+    sudo -u $SUDO_USER echo -e '\n\n### For Virtualenvwrapper ###' >> $HOME/.bashrc
+    sudo -u $SUDO_USER echo -e "export WORKON_HOME=$VIRT_DIR" >> $HOME/.bashrc
+    sudo -u $SUDO_USER echo -e 'source /usr/local/bin/virtualenvwrapper.sh' >> $HOME/.bashrc
+    sudo -u $SUDO_USER source $HOME/.bashrc
 
     echo "Creating directories..."
     sleep 1
-    #[[ -d "$HOME/test" ]] || sudo -u $SUDO_USER mkdir "$HOME/test"
-    #[[ -d $LOCAL_DIR ]] || sudo -u $SUDO_USER mkdir $LOCAL_DIR
-    #[[ -d $VIRT_DIR ]] || sudo -u $SUDO_USER mkdir $VIRT_DIR
+    [[ -d $LOCAL_DIR ]] || sudo -u $SUDO_USER mkdir $LOCAL_DIR
+    [[ -d $VIRT_DIR ]] || sudo -u $SUDO_USER mkdir $VIRT_DIR
 
     echo "Downloading python $PYTHON_VERSION...."
     gzarchive=$(basename "$PYTHON_URL")
     foldername=${gzarchive%.*}
-    #sudo -u $SUDO_USER wget -P /tmp $PYTHON_URL
+    sudo -u $SUDO_USER wget -P /tmp $PYTHON_URL
     if [ ! -f "/tmp/$gzarchive" ];
     then
         echo "oops. i was unable to download python, exiting."
@@ -56,11 +65,8 @@ main () {
         sudo -u $SUDO_USER mkdir "$LOCAL_DIR/$foldername"
         sudo -u $SUDO_USER ./configure --prefix="$LOCAL_DIR/$foldername"
         sudo -u $SUDO_USER make
-        #sudo -u $SUDO_USER make install
+        sudo -u $SUDO_USER make install
     fi
-    echo $PYTHON_URL
-    echo $SUDO_USER
-    echo $HOME
 }
 
 
