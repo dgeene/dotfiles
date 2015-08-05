@@ -8,6 +8,7 @@
 # Source virtualenvwrapper in bashrc
 # Export workon home variable
 # Compile python to ~/.localpythons
+#TODO need better handling of root and non-root commands
 
 
 if [ "$(id -u)" != "0" ]; then

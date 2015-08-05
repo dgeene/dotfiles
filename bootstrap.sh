@@ -38,7 +38,7 @@ SetupMessage
 
 dir=~/dotfiles
 olddir=~/old_dotfiles
-symlinks="vim vimrc tmux.conf"
+symlinks="vim vimrc tmux.conf tmux-layouts"
 
 main () {
 
@@ -46,10 +46,32 @@ main () {
     sleep 1
     #apt-get -y install vim tmux git
 
-    echo "Creating symlinks for $symlinks"
+
+
+    echo "Creating symlinks for $symlinks. Will backup old ones."
+    #[[ -d $olddir ]] || mkdir $olddir
     for link in $symlinks; do
-        echo "$link"
+        #mv ~/.$link $olddir
+        echo "Creating symlink for $link"
+        #ln -s $dir/$file ~/.$file
     done
+
+    echo "sourcing our functions from scripts/e"
+    echo -e '/n/nsource $HOME/dotfiles/scripts/functions' >> ~/.bashrc
+
+    echo "Pulling git submodules"
+    sleep 1
+    #git submodule init
+    #git submodule update
+
+    echo "Installing tmuxifier"
+    sleep 1
+    git clone https://github.com/jimeh/tmuxifier.git ~/.tmuxifier
+    echo -e "\n\n### For Tmuxifier ###" >> ~/.bashrc
+    echo -e 'export PATH="$HOME/.tmuxifier/bin:$PATH"' >> ~/.bashrc
+    echo -e 'export TMUXIFIER_LAYOUT_PATH="$HOME/.tmux-layouts' >> ~/.bashrc
+    echo -e 'export TMUXIFIER_TMUX_OPTS="-2"' >> ~/.bashrc
+    echo -e 'eval "$(tmuxifier init -)"' >> ~/.bashrc
 
 
 }
