@@ -12,6 +12,8 @@
 #   tmux-layouts
 #   tmux.conf
 #   bin
+# 3. Prompt for git username and email and set
+#    in config
 #
 #
 # ideas for bashrc
@@ -57,7 +59,7 @@ main () {
     done
 
     echo "sourcing our functions from scripts/e"
-    echo -e '/n/nsource $HOME/dotfiles/scripts/functions' >> ~/.bashrc
+    echo -e 'source $HOME/dotfiles/scripts/functions' >> ~/.bashrc
 
     echo "Pulling git submodules"
     sleep 1
@@ -69,7 +71,7 @@ main () {
     git clone https://github.com/jimeh/tmuxifier.git ~/.tmuxifier
     echo -e "\n\n### For Tmuxifier ###" >> ~/.bashrc
     echo -e 'export PATH="$HOME/.tmuxifier/bin:$PATH"' >> ~/.bashrc
-    echo -e 'export TMUXIFIER_LAYOUT_PATH="$HOME/.tmux-layouts' >> ~/.bashrc
+    echo -e 'export TMUXIFIER_LAYOUT_PATH="$HOME/.tmux-layouts"' >> ~/.bashrc
     echo -e 'export TMUXIFIER_TMUX_OPTS="-2"' >> ~/.bashrc
     echo -e 'eval "$(tmuxifier init -)"' >> ~/.bashrc
 
