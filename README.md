@@ -2,6 +2,8 @@ dotfiles
 ========
 Dave's Dotfiles
 
+The goal is to get a system up and running in as little time as possible. This repository will grow as I learn. I am constantly installing linux on something.
+
 ## Home Directory Setup
 ~/bin - for compiled binaries. Usually from outside sources and that I do not want synced.
 ~/bin/src - source files

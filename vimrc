@@ -1,4 +1,3 @@
-
 "to disable a plugin, add its bundle name to the following list
 "let g:pathogen_disabled = []
 "load pathogen and bundles
@@ -144,3 +143,12 @@ function! RD_RemoveTrailingSpaces()
 endfunction
 nmap <leader>tw :call RD_RemoveTrailingSpaces()<CR>
 
+"TODO wishlist
+" read and env variable to
+" configure vim with the 'kitchen sink' on desktop systems
+" or load a minimal set for low cpu systems
+" example:
+" let myvar=$MYVAR  "get an env var
+" if myvar == '1'
+" call doSomething
+" endif
