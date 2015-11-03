@@ -16,7 +16,8 @@ let g:NERDTreeDirArrows=0                    "this sisables nertree's use of uni
 set cursorline                               "highlight the current line. Disable if scrolling becomes laggy
 set ignorecase                               "searches are case insensitive
 set smartcase                                " ... unless they have at lease one capital
-set wildmenu                                 "use tab completion on command line
+set hlsearch                                 "highlight searches. Type :noh to disable
+set showmatch                                "briefly jump cursor to matching }, ] etc
 set history=300                              "remember more than 20 searches/commands
 
 "treat cursorline as line 0, helpful for motions
@@ -35,6 +36,14 @@ set splitright
 "better copy and paste
 set pastetoggle=<F2>
 set clipboard=unnamed
+
+
+" wildmenu
+set wildmenu
+set wildmode=longest:list,full
+"set wildignore=*.o,*.obj,~,*.pyc            "stuff to ignore when autocompleting
+"set wildignore+=*DS_Store*
+
 
 "easier moving of code blocks for better indentation
 vnoremap < <gv
