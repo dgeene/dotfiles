@@ -1,0 +1,60 @@
+" 'lighter' vimrc for low cpu/embedded systems
+" uses no plugins so symlinking vim/
+"  and git init-ing is not necessary
+
+set nocompatible
+filetype plugin indent on
+set ts=4
+set shiftwidth=4
+set expandtab
+let mapleader = ","
+set ignorecase
+set smartcase
+set hlsearch
+set showmatch
+set history=300
+set number
+nnoremap J mzJ`z
+set splitbelow
+set splitright
+set pastetoggle=<F2>
+set clipboard=unnamed
+set wildmenu
+set wildmode=longest:list,full
+vnoremap < <gv
+vnoremap > >gv
+set mouse=a
+set bs=2
+nnoremap <C-J> <C-W><C-J>
+nnoremap <C-K> <C-W><C-K>
+nnoremap <C-L> <C-W><C-L>
+nnoremap <C-H> <C-W><C-H>
+nmap G Gzz
+nmap n nzz
+nmap N Nzz
+nmap } }zz
+nmap { {zz
+no <down> <Nop>
+no <left> <Nop>
+no <right> <Nop>
+no <up> <Nop>
+ino <down> <Nop>
+ino <left> <Nop>
+ino <right> <Nop>
+ino <up> <Nop>
+autocmd ColorScheme * highlight ExtraWhitespace ctermbg=red guibg=red
+au InsertLeave * match ExtraWhitespace /\s\+$/
+syntax enable
+set t_Co=256
+colorscheme delek
+set laststatus=2
+
+function! RD_RemoveTrailingSpaces()
+    normal m`
+    let _lastsearch=@/
+    %s/\s\+$//e
+    let @/=_lastsearch
+    normal ``
+    echo "removed trailing spaces (if any)"
+endfunction
+nmap <leader>tw :call RD_RemoveTrailingSpaces()<CR>
