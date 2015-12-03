@@ -84,9 +84,6 @@ ino <down> <Nop>
 ino <left> <Nop>
 ino <right> <Nop>
 ino <up> <Nop>
-"move current line up or down
-no <down> ddp
-no <up> ddkP
 
 
 "insert ruby hash rocket, Ctrl-L
@@ -151,6 +148,14 @@ function! RD_RemoveTrailingSpaces()
     echo "removed trailing spaces (if any)"
 endfunction
 nmap <leader>tw :call RD_RemoveTrailingSpaces()<CR>
+
+" Punish those who use bad habits ;)
+function! Evil()
+    highlight ColorColumn ctermbg=red ctermfg=blue
+    exec 'set colorcolumn=' . join(range(2,80,3), ',')
+endfunction
+no <down> :call Evil()<CR>
+no <up> :call Evil()<CR>
 
 "TODO wishlist
 " read and env variable to
