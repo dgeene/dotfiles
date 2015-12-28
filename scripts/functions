@@ -37,5 +37,11 @@ dirsize() {
     rm -rf /tmp/list
 }
 
+
+# make a directory and cd into it
+mkcd() {
+    mkdir -p "$@" && cd "$@"
+}
+
 # vi:syntax=sh
 # vim: set filetype=sh
