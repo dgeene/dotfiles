@@ -85,6 +85,9 @@ ino <left> <Nop>
 ino <right> <Nop>
 ino <up> <Nop>
 
+" move current line up/down while fixing indent
+"nnoremap <Down> :m+<CR>==
+"nnoremap <Up> :m-2<CR>==
 
 "insert ruby hash rocket, Ctrl-L
 imap <c-l> <space>=><space>
