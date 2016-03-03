@@ -6,6 +6,7 @@ execute pathogen#infect()
 
 set nocompatible                             "no need to be compatible with old vim
 map <C-n> :NERDTreeToggle<CR>
+let NERDTreeIgnore = ['\.pyc$']
 autocmd! bufwritepost .vimrc source %        "Automatic reload of .vimrc when saving
 filetype plugin indent on
 set ts=4                                     "set indent to 4 spaces
