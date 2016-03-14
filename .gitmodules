@@ -1,21 +1,12 @@
-[submodule "vim/bundle/molokai"]
-	path = vim/bundle/molokai
-	url = https://github.com/tomasr/molokai.git
+# vim plugins
 [submodule "vim/bundle/nerdtree"]
 	path = vim/bundle/nerdtree
 	url = https://github.com/scrooloose/nerdtree.git
-[submodule "vim/bundle/Wombat"]
-	path = vim/bundle/Wombat
-	url = https://github.com/vim-scripts/Wombat.git
-[submodule "vim/bundle/vim-monokai"]
-	path = vim/bundle/vim-monokai
-	url = https://github.com/sickill/vim-monokai.git
-[submodule "vim/bundle/vim-wombat256mod"]
-	path = vim/bundle/vim-wombat256mod
-	url = https://github.com/michalbachowski/vim-wombat256mod.git
 [submodule "vim/bundle/ctrlp.vim"]
 	path = vim/bundle/ctrlp.vim
 	url = https://github.com/kien/ctrlp.vim.git
+
+# vim colorschemes
 [submodule "vim/bundle/badwolf"]
 	path = vim/bundle/badwolf
 	url = https://github.com/sjl/badwolf.git
@@ -25,15 +16,33 @@
 [submodule "vim/bundle/vim-colors-solarized"]
 	path = vim/bundle/vim-colors-solarized
 	url = https://github.com/altercation/vim-colors-solarized.git
-[submodule "vim/bundle/vim-javascript-syntax"]
-	path = vim/bundle/vim-javascript-syntax
-	url = https://github.com/jelera/vim-javascript-syntax.git
-[submodule "vim/bundle/javascript-libraries-syntax"]
-	path = vim/bundle/javascript-libraries-syntax
-	url = https://github.com/othree/javascript-libraries-syntax.vim.git
 [submodule "vim/bundle/vim-vividchalk"]
 	path = vim/bundle/vim-vividchalk
 	url = https://github.com/tpope/vim-vividchalk.git
 [submodule "vim/bundle/Apprentice"]
 	path = vim/bundle/Apprentice
 	url = https://github.com/romainl/Apprentice.git
+[submodule "vim/bundle/molokai"]
+	path = vim/bundle/molokai
+	url = https://github.com/tomasr/molokai.git
+[submodule "vim/bundle/Wombat"]
+	path = vim/bundle/Wombat
+	url = https://github.com/vim-scripts/Wombat.git
+[submodule "vim/bundle/vim-monokai"]
+	path = vim/bundle/vim-monokai
+	url = https://github.com/sickill/vim-monokai.git
+[submodule "vim/bundle/vim-wombat256mod"]
+	path = vim/bundle/vim-wombat256mod
+	url = https://github.com/michalbachowski/vim-wombat256mod.git
+
+
+# Javascript stuff
+[submodule "vim/bundle/vim-javascript-syntax"]
+	path = vim/bundle/vim-javascript-syntax
+	url = https://github.com/jelera/vim-javascript-syntax.git
+[submodule "vim/bundle/vim-javascript"]
+	path = vim/bundle/vim-javascript
+	url = https://github.com/pangloss/vim-javascript.git
+[submodule "vim/bundle/javascript-libraries-syntax"]
+	path = vim/bundle/javascript-libraries-syntax
+	url = https://github.com/othree/javascript-libraries-syntax.vim.git
