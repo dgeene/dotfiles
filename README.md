@@ -20,6 +20,7 @@ vimrc examples from:https://www.youtube.com/watch?v=YhqsjUUHj6g
 
 
 ## Git submodules
+We can use gitmodules as a way of keeping our repo clean. We can include a reference to third part code without actually storing it in our own repo.
 After the repo has been cloned run:
 ```bash
 $ cd dotfiles
@@ -45,6 +46,8 @@ Using ctrlp as an example,
 ~/dotfiles$ git commit -m "added ctrlp vim plugin"
 ~/dotfiles$ git push
 ```
+
+Just make sure.. Pay attention to whether or not the github repo is a folder or a file. The designated directory will matter.
 
 
 ## Notes about TMUX
