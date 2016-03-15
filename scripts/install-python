@@ -31,7 +31,7 @@ main () {
     apt-get update
     apt-get install -y build-essential python-dev libssl-dev \
 			zlib1g-dev libbz2-dev libreadline6-dev \
-			libsqlite3-dev libgdm-dev libmysqlclient-dev \
+			libsqlite3-dev libgdbm-dev libmysqlclient-dev \
 			python-pip
 
     pip install virtualenv virtualenvwrapper
