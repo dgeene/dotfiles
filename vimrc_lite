@@ -1,3 +1,4 @@
+" full version: https://github.com/dgeene/dotfiles/blob/master/vimrc
 " 'lighter' vimrc for low cpu/embedded systems
 " uses no plugins so symlinking vim/
 "  and git init-ing is not necessary
