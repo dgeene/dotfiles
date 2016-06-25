@@ -17,7 +17,7 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 # keep it simple and just get latest here
-PYTHON_VERSION="2.7.10"
+PYTHON_VERSION="2.7.11"
 PYTHON_URL="http://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tgz"
 LOCAL_DIR="$HOME/.localpythons"
 VIRT_DIR="$HOME/.virtualenvs"
