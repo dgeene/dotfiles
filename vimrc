@@ -154,12 +154,12 @@ endfunction
 nmap <leader>tw :call RD_RemoveTrailingSpaces()<CR>
 
 " Punish those who use bad habits ;)
-function! Evil()
-    highlight ColorColumn ctermbg=red ctermfg=blue
-    exec 'set colorcolumn=' . join(range(2,80,3), ',')
-endfunction
-no <down> :call Evil()<CR>
-no <up> :call Evil()<CR>
+"function! Evil()
+"    highlight ColorColumn ctermbg=red ctermfg=blue
+"    exec 'set colorcolumn=' . join(range(2,80,3), ',')
+"endfunction
+"no <down> :call Evil()<CR>
+"no <up> :call Evil()<CR>
 
 "TODO wishlist
 " read and env variable to
