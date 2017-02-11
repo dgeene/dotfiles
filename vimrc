@@ -111,8 +111,8 @@ colorscheme apprentice
 
 "highlight 80 char columns
 "set colorcolumn=80 was ctermbg=233
-highlight ColorColumn ctermbg=219
-call matchadd('ColorColumn', '\%80v', 100)
+"highlight ColorColumn ctermbg=219
+"call matchadd('ColorColumn', '\%80v', 100)
 
 
 
