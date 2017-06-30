@@ -25,9 +25,6 @@
 [submodule "vim/bundle/Wombat"]
 	path = vim/bundle/Wombat
 	url = https://github.com/vim-scripts/Wombat.git
-[submodule "vim/bundle/vim-monokai"]
-	path = vim/bundle/vim-monokai
-	url = https://github.com/sickill/vim-monokai.git
 [submodule "vim/bundle/vim-wombat256mod"]
 	path = vim/bundle/vim-wombat256mod
 	url = https://github.com/michalbachowski/vim-wombat256mod.git
