@@ -43,6 +43,21 @@ To add more vim plugins as submodules:
 Using ctrlp as an example,
 ```bash
 ~/dotfiles$ git submodule add https://github.com/kien/ctrlp.vim.git vim/bundle/ctrlp.vim
+```
+
+If you do a git status you will notice it modified the gitmodules file and added a new file.
+```bash
+Changes to be committed:
+  (use "git reset HEAD <file>..." to unstage)
+
+    modified:   .gitmodules
+    new file:   vim/bundle/rust.vim
+```
+This new file is ok as git is adding a reference to the file.
+
+It is safe to commit these.
+
+```bash
 ~/dotfiles$ git commit -m "added ctrlp vim plugin"
 ~/dotfiles$ git push
 ```
