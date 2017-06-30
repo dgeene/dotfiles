@@ -22,9 +22,6 @@
 [submodule "vim/bundle/Apprentice"]
 	path = vim/bundle/Apprentice
 	url = https://github.com/romainl/Apprentice.git
-[submodule "vim/bundle/molokai"]
-	path = vim/bundle/molokai
-	url = https://github.com/tomasr/molokai.git
 [submodule "vim/bundle/Wombat"]
 	path = vim/bundle/Wombat
 	url = https://github.com/vim-scripts/Wombat.git
