@@ -27,10 +27,10 @@
 	url = https://github.com/michalbachowski/vim-wombat256mod.git
 [submodule "vim/bundle/Alduin"]
 	path = vim/bundle/Alduin
-	url = git@github.com:AlessandroYorba/Alduin.git
+	url = https://github.com/AlessandroYorba/Alduin.git
 [submodule "vim/bundle/Despacio"]
 	path = vim/bundle/Despacio
-	url = git@github.com:AlessandroYorba/Despacio.git
+	url = https://github.com/AlessandroYorba/Despacio.git
 
 #####################
 # Language Syntax   #
