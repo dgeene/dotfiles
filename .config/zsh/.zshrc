@@ -1,5 +1,5 @@
 #!/bin/sh
-# read second
+# parsed second
 
 
 

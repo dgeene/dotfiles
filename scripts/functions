@@ -43,5 +43,10 @@ mkcd() {
     mkdir -p "$@" && cd "$@"
 }
 
+# print PATH dirs on a newline
+path() {
+    echo "$PATH" | tr ':' '\n'
+}
+
 # vi:syntax=sh
 # vim: set filetype=sh

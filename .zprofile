@@ -1,5 +1,5 @@
 #!/bin/sh
-# read first
+# parsed first
 # env vars to be set on login, zsh settings in ~/.zshrc
 
 
