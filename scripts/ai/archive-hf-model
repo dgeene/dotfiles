@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+#
+# It downloads a Hugging Face repository, copies it to the NAS with rsync, and creates a SHA-256 checksum manifest.
+#
+
+set -euo pipefail
+
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
+
+NAS="/mnt/ai-models"
+LOCAL="/tmp/hf-model-downloads"
+
+# ------------------------------------------------------------
+# Usage
+# ------------------------------------------------------------
+
+usage() {
+    echo "Usage:"
+    echo "  $0 <huggingface-repo> <destination-name>"
+    echo
+    echo "Example:"
+    echo "  $0 Qwen/Qwen3-8B Qwen3-8B"
+    echo
+    echo "Environment:"
+    echo "  HF_TOKEN   Optional Hugging Face access token"
+    exit 1
+}
+
+[[ $# -eq 2 ]] || usage
+
+HF_REPO="$1"
+MODEL_NAME="$2"
+
+# Extract organization from repository name.
+ORG="${HF_REPO%%/*}"
+
+LOCAL_MODEL="${LOCAL}/${MODEL_NAME}"
+NAS_MODEL="${NAS}/huggingface/${ORG}/${MODEL_NAME}"
+CHECKSUM="${NAS}/checksums/huggingface/${ORG}/${MODEL_NAME}.sha256"
+
+# ------------------------------------------------------------
+# Create directories
+# ------------------------------------------------------------
+
+mkdir -p "$LOCAL"
+mkdir -p "$(dirname "$NAS_MODEL")"
+mkdir -p "$(dirname "$CHECKSUM")"
+
+# ------------------------------------------------------------
+# Download
+# ------------------------------------------------------------
+
+echo
+echo "========================================"
+echo "Downloading Hugging Face model"
+echo "========================================"
+echo "Repository : $HF_REPO"
+echo "Local      : $LOCAL_MODEL"
+echo "NAS        : $NAS_MODEL"
+echo
+
+if [[ -n "${HF_TOKEN:-}" ]]; then
+    hf download "$HF_REPO" \
+        --local-dir "$LOCAL_MODEL" \
+        --token "$HF_TOKEN"
+else
+    hf download "$HF_REPO" \
+        --local-dir "$LOCAL_MODEL"
+fi
+
+# ------------------------------------------------------------
+# Copy to NAS
+# ------------------------------------------------------------
+
+echo
+echo "========================================"
+echo "Syncing model to NAS"
+echo "========================================"
+
+rsync \
+    -avh \
+    --info=progress2 \
+    --partial \
+    "$LOCAL_MODEL/" \
+    "$NAS_MODEL/"
+
+# ------------------------------------------------------------
+# Generate checksums
+# ------------------------------------------------------------
+
+echo
+echo "========================================"
+echo "Generating SHA-256 checksums"
+echo "========================================"
+
+(
+    cd "$NAS_MODEL"
+
+    find . -type f -print0 \
+        | sort -z \
+        | xargs -0 sha256sum
+) > "$CHECKSUM"
+
+echo
+echo "Checksum:"
+echo "  $CHECKSUM"
+
+# ------------------------------------------------------------
+# Summary
+# ------------------------------------------------------------
+
+echo
+echo "========================================"
+echo "Complete"
+echo "========================================"
+
+du -sh "$NAS_MODEL"
+
+echo
+echo "Model:"
+echo "  $NAS_MODEL"
+
+echo
+echo "Checksum:"
+echo "  $CHECKSUM"
