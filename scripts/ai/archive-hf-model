@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Download a Hugging Face model, sync it to NAS storage, and create a SHA-256
-checksum manifest.
+Download a Hugging Face model, sync it to NAS storage, or package it as a
+local tar archive with a SHA-256 checksum.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -26,13 +27,15 @@ class ArchivePaths:
     local_model: Path
     nas_model: Path
     checksum: Path
+    local_archive: Path
+    local_archive_checksum: Path
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Download a Hugging Face model, sync it to a NAS with rsync, "
-            "and write a SHA-256 checksum manifest."
+            "or package it as a local tar archive with a SHA-256 checksum."
         ),
         epilog="Authentication: set HF_TOKEN in the environment for private or gated models.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -54,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     stage_group.add_argument(
         "--all",
         action="store_true",
-        help="Run download, sync, and checksum stages.",
+        help="Run the standard download, sync, and NAS checksum stages.",
     )
     stage_group.add_argument(
         "--download",
@@ -70,6 +73,21 @@ def parse_args() -> argparse.Namespace:
         "--checksum",
         action="store_true",
         help="Generate the SHA-256 checksum manifest from the NAS copy.",
+    )
+    stage_group.add_argument(
+        "--archive",
+        action="store_true",
+        help="Create a local .tar.zst archive from the local model directory.",
+    )
+    stage_group.add_argument(
+        "--archive-checksum",
+        action="store_true",
+        help="Generate a SHA-256 checksum for an existing local tar archive.",
+    )
+    stage_group.add_argument(
+        "--no-archive-checksum",
+        action="store_true",
+        help="Do not automatically checksum the tar archive created by --archive.",
     )
 
     path_group = parser.add_argument_group("paths")
@@ -91,6 +109,22 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Existing or desired local model directory. Use this when the model "
             "was already downloaded somewhere outside --local-root."
+        ),
+    )
+    path_group.add_argument(
+        "--archive-dir",
+        type=Path,
+        help=(
+            "Directory for local tar archives. Defaults to the local model "
+            "directory's parent."
+        ),
+    )
+    path_group.add_argument(
+        "--archive-path",
+        type=Path,
+        help=(
+            "Specific local tar archive path. Defaults to "
+            "<archive-dir>/<model-name>.tar.zst."
         ),
     )
 
@@ -133,17 +167,36 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
 
-    selected_stages = [args.download, args.sync, args.checksum]
+    selected_stages = [
+        args.download,
+        args.sync,
+        args.checksum,
+        args.archive,
+        args.archive_checksum,
+    ]
     if args.all and any(selected_stages):
-        parser.error("--all cannot be combined with --download, --sync, or --checksum")
+        parser.error(
+            "--all cannot be combined with --download, --sync, --checksum, "
+            "--archive, or --archive-checksum"
+        )
     if args.max_workers is not None and args.max_workers < 1:
         parser.error("--max-workers must be greater than 0")
+    if args.no_archive_checksum and not args.archive:
+        parser.error("--no-archive-checksum requires --archive")
+    if args.archive_dir and args.archive_path:
+        parser.error("--archive-dir cannot be combined with --archive-path")
 
     return args
 
 
 def selected_stages(args: argparse.Namespace) -> set[str]:
-    if args.all or not (args.download or args.sync or args.checksum):
+    if args.all or not (
+        args.download
+        or args.sync
+        or args.checksum
+        or args.archive
+        or args.archive_checksum
+    ):
         return {"download", "sync", "checksum"}
 
     stages: set[str] = set()
@@ -153,6 +206,12 @@ def selected_stages(args: argparse.Namespace) -> set[str]:
         stages.add("sync")
     if args.checksum:
         stages.add("checksum")
+    if args.archive:
+        stages.add("archive")
+        if not args.no_archive_checksum:
+            stages.add("archive_checksum")
+    if args.archive_checksum:
+        stages.add("archive_checksum")
     return stages
 
 
@@ -177,11 +236,16 @@ def build_paths(args: argparse.Namespace, model_name: str) -> ArchivePaths:
     )
     nas_model = args.nas_root / "huggingface" / org / model_name
     checksum = args.nas_root / "checksums" / "huggingface" / org / f"{model_name}.sha256"
+    archive_dir = args.archive_dir if args.archive_dir else local_model.parent
+    local_archive = args.archive_path if args.archive_path else archive_dir / f"{model_name}.tar.zst"
+    local_archive_checksum = Path(f"{local_archive}.sha256")
 
     return ArchivePaths(
         local_model=resolve_path(local_model),
         nas_model=resolve_path(nas_model),
         checksum=resolve_path(checksum),
+        local_archive=resolve_path(local_archive),
+        local_archive_checksum=resolve_path(local_archive_checksum),
     )
 
 
@@ -287,17 +351,76 @@ def write_checksums(paths: ArchivePaths) -> None:
             )
 
 
+def create_local_archive(paths: ArchivePaths) -> None:
+    require_command("tar")
+    if not paths.local_model.is_dir():
+        raise SystemExit(f"ERROR: local model directory does not exist: {paths.local_model}")
+
+    paths.local_archive.parent.mkdir(parents=True, exist_ok=True)
+
+    print_section("Creating local tar archive")
+    print(f"Source  : {paths.local_model}")
+    print(f"Archive : {paths.local_archive}")
+    print()
+
+    with tempfile.NamedTemporaryFile(
+        dir=paths.local_archive.parent,
+        prefix=f".{paths.local_archive.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temp_file:
+        temp_archive = Path(temp_file.name)
+
+    try:
+        command = [
+            "tar",
+            "--zstd",
+            "-cvf",
+            str(temp_archive),
+            "-C",
+            str(paths.local_model.parent),
+            paths.local_model.name,
+        ]
+        run_command(command)
+        temp_archive.replace(paths.local_archive)
+    finally:
+        temp_archive.unlink(missing_ok=True)
+
+
+def write_archive_checksum(paths: ArchivePaths) -> None:
+    if not paths.local_archive.is_file():
+        raise SystemExit(f"ERROR: local archive does not exist: {paths.local_archive}")
+
+    paths.local_archive_checksum.parent.mkdir(parents=True, exist_ok=True)
+
+    print_section("Generating archive SHA-256 checksum")
+    print(f"Archive  : {paths.local_archive}")
+    print(f"Checksum : {paths.local_archive_checksum}")
+    print()
+
+    checksum = sha256_file(paths.local_archive)
+    with paths.local_archive_checksum.open("w", encoding="utf-8") as checksum_file:
+        checksum_file.write(f"{checksum}  {paths.local_archive.name}\n")
+
+
 def summarize(paths: ArchivePaths, stages: set[str]) -> None:
     print_section("Complete")
     stage_list = ", ".join(
-        stage for stage in ("download", "sync", "checksum") if stage in stages
+        stage
+        for stage in ("download", "sync", "checksum", "archive", "archive_checksum")
+        if stage in stages
     )
     print(f"Stages   : {stage_list}")
-    print(f"Local    : {paths.local_model}")
-    print(f"Model    : {paths.nas_model}")
-    print(f"Checksum : {paths.checksum}")
+    if "download" in stages or "sync" in stages or "archive" in stages:
+        print(f"Local    : {paths.local_model}")
+    if "sync" in stages or "checksum" in stages:
+        print(f"Model    : {paths.nas_model}")
+        print(f"Checksum : {paths.checksum}")
+    if "archive" in stages or "archive_checksum" in stages:
+        print(f"Archive  : {paths.local_archive}")
+        print(f"Archive checksum : {paths.local_archive_checksum}")
 
-    if paths.nas_model.exists():
+    if ("sync" in stages or "checksum" in stages) and paths.nas_model.exists():
         du = shutil.which("du")
         if du is not None:
             sys.stdout.flush()
@@ -316,6 +439,10 @@ def main() -> int:
         sync_to_nas(args, paths)
     if "checksum" in stages:
         write_checksums(paths)
+    if "archive" in stages:
+        create_local_archive(paths)
+    if "archive_checksum" in stages:
+        write_archive_checksum(paths)
 
     summarize(paths, stages)
     return 0

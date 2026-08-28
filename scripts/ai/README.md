@@ -157,6 +157,12 @@ the download stage.
 # Sync an already-downloaded local model to the NAS and create checksums
 ./archive-hf-model Qwen/Qwen3-8B Qwen3-8B --sync --checksum
 
+# Create a local tar archive and checksum for manual copying
+./archive-hf-model Qwen/Qwen3-8B Qwen3-8B --archive
+
+# Download, then create a local tar archive and checksum
+./archive-hf-model Qwen/Qwen3-8B Qwen3-8B --download --archive
+
 # Use a local model directory outside the default staging root
 ./archive-hf-model Qwen/Qwen3-8B Qwen3-8B \
     --local-model-dir ~/ai/downloads/Qwen3-8B \
@@ -169,6 +175,21 @@ If something fails halfway through, rerun it
 rsync will avoid retransferring files that are already identical.
 
 The --partial option also helps with interrupted transfers.
+
+For manual copying, the archive stage writes a local `.tar.zst` next to the
+local model directory by default, plus a matching `.sha256` file:
+
+```text
+/tmp/hf-model-downloads/Qwen3-8B.tar.zst
+/tmp/hf-model-downloads/Qwen3-8B.tar.zst.sha256
+```
+
+Copy both files to the NAS, then verify the archive from the directory that
+contains both files:
+
+```shell
+sha256sum -c Qwen3-8B.tar.zst.sha256
+```
 
 Verifying the entire model
 ```shell
