@@ -78,6 +78,25 @@ NAS:/mnt/ai-models/huggingface/
 # /mnt/ai-models/huggingface/Qwen/Qwen3-8B/
 ```
 
+Run only selected stages by passing one or more stage flags. If no stage flags
+are passed, the command runs the full download, sync, and checksum workflow.
+For private or gated models, set `HF_TOKEN` in the environment before running
+the download stage.
+
+```shell
+# Download only
+./archive-hf-model Qwen/Qwen3-8B Qwen3-8B --download
+
+# Sync an already-downloaded local model to the NAS and create checksums
+./archive-hf-model Qwen/Qwen3-8B Qwen3-8B --sync --checksum
+
+# Use a local model directory outside the default staging root
+./archive-hf-model Qwen/Qwen3-8B Qwen3-8B \
+    --local-model-dir ~/ai/downloads/Qwen3-8B \
+    --sync \
+    --checksum
+```
+
 If something fails halfway through, rerun it
 
 rsync will avoid retransferring files that are already identical.

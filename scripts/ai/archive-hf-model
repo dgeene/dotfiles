@@ -1,127 +1,329 @@
-#!/usr/bin/env bash
-#
-# It downloads a Hugging Face repository, copies it to the NAS with rsync, and creates a SHA-256 checksum manifest.
-#
+#!/usr/bin/env python3
+"""
+Download a Hugging Face model, sync it to NAS storage, and create a SHA-256
+checksum manifest.
+"""
 
-set -euo pipefail
+from __future__ import annotations
 
-# ------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------
+import argparse
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
 
-NAS="/mnt/ai-models"
-LOCAL="/tmp/hf-model-downloads"
 
-# ------------------------------------------------------------
-# Usage
-# ------------------------------------------------------------
+DEFAULT_NAS_ROOT = "/mnt/ai-models"
+DEFAULT_LOCAL_ROOT = "/tmp/hf-model-downloads"
 
-usage() {
-    echo "Usage:"
-    echo "  $0 <huggingface-repo> <destination-name>"
-    echo
-    echo "Example:"
-    echo "  $0 Qwen/Qwen3-8B Qwen3-8B"
-    echo
-    echo "Environment:"
-    echo "  HF_TOKEN   Optional Hugging Face access token"
-    exit 1
-}
 
-[[ $# -eq 2 ]] || usage
+@dataclass(frozen=True)
+class ArchivePaths:
+    local_model: Path
+    nas_model: Path
+    checksum: Path
 
-HF_REPO="$1"
-MODEL_NAME="$2"
 
-# Extract organization from repository name.
-ORG="${HF_REPO%%/*}"
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Download a Hugging Face model, sync it to a NAS with rsync, "
+            "and write a SHA-256 checksum manifest."
+        ),
+        epilog="Authentication: set HF_TOKEN in the environment for private or gated models.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "hf_repo",
+        help="Hugging Face repository ID, for example Qwen/Qwen3-8B.",
+    )
+    parser.add_argument(
+        "model_name",
+        nargs="?",
+        help=(
+            "Destination directory name. Defaults to the final component of "
+            "the Hugging Face repository ID."
+        ),
+    )
 
-LOCAL_MODEL="${LOCAL}/${MODEL_NAME}"
-NAS_MODEL="${NAS}/huggingface/${ORG}/${MODEL_NAME}"
-CHECKSUM="${NAS}/checksums/huggingface/${ORG}/${MODEL_NAME}.sha256"
+    stage_group = parser.add_argument_group("stage selection")
+    stage_group.add_argument(
+        "--all",
+        action="store_true",
+        help="Run download, sync, and checksum stages.",
+    )
+    stage_group.add_argument(
+        "--download",
+        action="store_true",
+        help="Download the Hugging Face repository into the local staging directory.",
+    )
+    stage_group.add_argument(
+        "--sync",
+        action="store_true",
+        help="Sync the local model directory to the NAS with rsync.",
+    )
+    stage_group.add_argument(
+        "--checksum",
+        action="store_true",
+        help="Generate the SHA-256 checksum manifest from the NAS copy.",
+    )
 
-# ------------------------------------------------------------
-# Create directories
-# ------------------------------------------------------------
+    path_group = parser.add_argument_group("paths")
+    path_group.add_argument(
+        "--nas-root",
+        type=Path,
+        default=Path(os.environ.get("AI_MODELS_NAS_ROOT", DEFAULT_NAS_ROOT)),
+        help="Root of the NAS model archive.",
+    )
+    path_group.add_argument(
+        "--local-root",
+        type=Path,
+        default=Path(os.environ.get("HF_MODEL_DOWNLOAD_ROOT", DEFAULT_LOCAL_ROOT)),
+        help="Root directory for local model downloads.",
+    )
+    path_group.add_argument(
+        "--local-model-dir",
+        type=Path,
+        help=(
+            "Existing or desired local model directory. Use this when the model "
+            "was already downloaded somewhere outside --local-root."
+        ),
+    )
 
-mkdir -p "$LOCAL"
-mkdir -p "$(dirname "$NAS_MODEL")"
-mkdir -p "$(dirname "$CHECKSUM")"
+    download_group = parser.add_argument_group("download options")
+    download_group.add_argument(
+        "--revision",
+        help="Git revision, branch, tag, or commit to download from Hugging Face.",
+    )
+    download_group.add_argument(
+        "--include",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="File pattern to include during hf download. May be passed multiple times.",
+    )
+    download_group.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="File pattern to exclude during hf download. May be passed multiple times.",
+    )
+    download_group.add_argument(
+        "--force-download",
+        action="store_true",
+        help="Pass --force-download to hf download.",
+    )
+    download_group.add_argument(
+        "--max-workers",
+        type=int,
+        help="Pass --max-workers to hf download.",
+    )
 
-# ------------------------------------------------------------
-# Download
-# ------------------------------------------------------------
+    rsync_group = parser.add_argument_group("sync options")
+    rsync_group.add_argument(
+        "--rsync-delete",
+        action="store_true",
+        help="Delete extraneous files from the NAS destination during rsync.",
+    )
 
-echo
-echo "========================================"
-echo "Downloading Hugging Face model"
-echo "========================================"
-echo "Repository : $HF_REPO"
-echo "Local      : $LOCAL_MODEL"
-echo "NAS        : $NAS_MODEL"
-echo
+    args = parser.parse_args()
 
-if [[ -n "${HF_TOKEN:-}" ]]; then
-    hf download "$HF_REPO" \
-        --local-dir "$LOCAL_MODEL" \
-        --token "$HF_TOKEN"
-else
-    hf download "$HF_REPO" \
-        --local-dir "$LOCAL_MODEL"
-fi
+    selected_stages = [args.download, args.sync, args.checksum]
+    if args.all and any(selected_stages):
+        parser.error("--all cannot be combined with --download, --sync, or --checksum")
+    if args.max_workers is not None and args.max_workers < 1:
+        parser.error("--max-workers must be greater than 0")
 
-# ------------------------------------------------------------
-# Copy to NAS
-# ------------------------------------------------------------
+    return args
 
-echo
-echo "========================================"
-echo "Syncing model to NAS"
-echo "========================================"
 
-rsync \
-    -avh \
-    --info=progress2 \
-    --partial \
-    "$LOCAL_MODEL/" \
-    "$NAS_MODEL/"
+def selected_stages(args: argparse.Namespace) -> set[str]:
+    if args.all or not (args.download or args.sync or args.checksum):
+        return {"download", "sync", "checksum"}
 
-# ------------------------------------------------------------
-# Generate checksums
-# ------------------------------------------------------------
+    stages: set[str] = set()
+    if args.download:
+        stages.add("download")
+    if args.sync:
+        stages.add("sync")
+    if args.checksum:
+        stages.add("checksum")
+    return stages
 
-echo
-echo "========================================"
-echo "Generating SHA-256 checksums"
-echo "========================================"
 
-(
-    cd "$NAS_MODEL"
+def repo_org(hf_repo: str) -> str:
+    return hf_repo.split("/", 1)[0]
 
-    find . -type f -print0 \
-        | sort -z \
-        | xargs -0 sha256sum
-) > "$CHECKSUM"
 
-echo
-echo "Checksum:"
-echo "  $CHECKSUM"
+def default_model_name(hf_repo: str) -> str:
+    return hf_repo.rstrip("/").split("/")[-1]
 
-# ------------------------------------------------------------
-# Summary
-# ------------------------------------------------------------
 
-echo
-echo "========================================"
-echo "Complete"
-echo "========================================"
+def resolve_path(path: Path) -> Path:
+    return path.expanduser().resolve()
 
-du -sh "$NAS_MODEL"
 
-echo
-echo "Model:"
-echo "  $NAS_MODEL"
+def build_paths(args: argparse.Namespace, model_name: str) -> ArchivePaths:
+    org = repo_org(args.hf_repo)
+    local_model = (
+        args.local_model_dir
+        if args.local_model_dir is not None
+        else args.local_root / model_name
+    )
+    nas_model = args.nas_root / "huggingface" / org / model_name
+    checksum = args.nas_root / "checksums" / "huggingface" / org / f"{model_name}.sha256"
 
-echo
-echo "Checksum:"
-echo "  $CHECKSUM"
+    return ArchivePaths(
+        local_model=resolve_path(local_model),
+        nas_model=resolve_path(nas_model),
+        checksum=resolve_path(checksum),
+    )
+
+
+def print_section(title: str) -> None:
+    print()
+    print("=" * 40)
+    print(title)
+    print("=" * 40)
+
+
+def require_command(command: str) -> None:
+    if shutil.which(command) is None:
+        raise SystemExit(f"ERROR: {command} is required but was not found in PATH")
+
+
+def run_command(command: list[str]) -> None:
+    sys.stdout.flush()
+    subprocess.run(command, check=True)
+
+
+def download_model(args: argparse.Namespace, paths: ArchivePaths) -> None:
+    require_command("hf")
+    paths.local_model.parent.mkdir(parents=True, exist_ok=True)
+
+    print_section("Downloading Hugging Face model")
+    print(f"Repository : {args.hf_repo}")
+    print(f"Local      : {paths.local_model}")
+    print()
+
+    command = ["hf", "download", args.hf_repo, "--local-dir", str(paths.local_model)]
+
+    if args.revision:
+        command.extend(["--revision", args.revision])
+    for pattern in args.include:
+        command.extend(["--include", pattern])
+    for pattern in args.exclude:
+        command.extend(["--exclude", pattern])
+    if args.force_download:
+        command.append("--force-download")
+    if args.max_workers is not None:
+        command.extend(["--max-workers", str(args.max_workers)])
+
+    run_command(command)
+
+
+def sync_to_nas(args: argparse.Namespace, paths: ArchivePaths) -> None:
+    require_command("rsync")
+    if not paths.local_model.is_dir():
+        raise SystemExit(f"ERROR: local model directory does not exist: {paths.local_model}")
+
+    paths.nas_model.parent.mkdir(parents=True, exist_ok=True)
+
+    print_section("Syncing model to NAS")
+    print(f"Source      : {paths.local_model}")
+    print(f"Destination : {paths.nas_model}")
+    print()
+
+    command = [
+        "rsync",
+        "-avh",
+        "--info=progress2",
+        "--partial",
+    ]
+    if args.rsync_delete:
+        command.append("--delete")
+    command.extend([f"{paths.local_model}/", f"{paths.nas_model}/"])
+
+    run_command(command)
+
+
+def iter_files(root: Path) -> Iterable[Path]:
+    return sorted(path for path in root.rglob("*") if path.is_file())
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def checksum_name(root: Path, path: Path) -> str:
+    relative = path.relative_to(root).as_posix()
+    return f"./{relative}"
+
+
+def write_checksums(paths: ArchivePaths) -> None:
+    if not paths.nas_model.is_dir():
+        raise SystemExit(f"ERROR: NAS model directory does not exist: {paths.nas_model}")
+
+    paths.checksum.parent.mkdir(parents=True, exist_ok=True)
+
+    print_section("Generating SHA-256 checksums")
+    print(f"Model    : {paths.nas_model}")
+    print(f"Checksum : {paths.checksum}")
+    print()
+
+    with paths.checksum.open("w", encoding="utf-8") as checksum_file:
+        for path in iter_files(paths.nas_model):
+            checksum_file.write(
+                f"{sha256_file(path)}  {checksum_name(paths.nas_model, path)}\n"
+            )
+
+
+def summarize(paths: ArchivePaths, stages: set[str]) -> None:
+    print_section("Complete")
+    stage_list = ", ".join(
+        stage for stage in ("download", "sync", "checksum") if stage in stages
+    )
+    print(f"Stages   : {stage_list}")
+    print(f"Local    : {paths.local_model}")
+    print(f"Model    : {paths.nas_model}")
+    print(f"Checksum : {paths.checksum}")
+
+    if paths.nas_model.exists():
+        du = shutil.which("du")
+        if du is not None:
+            sys.stdout.flush()
+            subprocess.run([du, "-sh", str(paths.nas_model)], check=False)
+
+
+def main() -> int:
+    args = parse_args()
+    stages = selected_stages(args)
+    model_name = args.model_name or default_model_name(args.hf_repo)
+    paths = build_paths(args, model_name)
+
+    if "download" in stages:
+        download_model(args, paths)
+    if "sync" in stages:
+        sync_to_nas(args, paths)
+    if "checksum" in stages:
+        write_checksums(paths)
+
+    summarize(paths, stages)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except subprocess.CalledProcessError as error:
+        print(f"ERROR: command failed with exit code {error.returncode}: {error.cmd}", file=sys.stderr)
+        raise SystemExit(error.returncode)
