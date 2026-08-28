@@ -154,6 +154,9 @@ the download stage.
 # Download only
 ./archive-hf-model Qwen/Qwen3-8B Qwen3-8B --download
 
+# Download with one worker to avoid saturating the connection
+./archive-hf-model Qwen/Qwen3-8B Qwen3-8B --download --limit
+
 # Sync an already-downloaded local model to the NAS and create checksums
 ./archive-hf-model Qwen/Qwen3-8B Qwen3-8B --sync --checksum
 

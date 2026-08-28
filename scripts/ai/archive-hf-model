@@ -153,6 +153,11 @@ def parse_args() -> argparse.Namespace:
         help="Pass --force-download to hf download.",
     )
     download_group.add_argument(
+        "--limit",
+        action="store_true",
+        help="Limit hf download concurrency by passing --max-workers 1.",
+    )
+    download_group.add_argument(
         "--max-workers",
         type=int,
         help="Pass --max-workers to hf download.",
@@ -181,6 +186,8 @@ def parse_args() -> argparse.Namespace:
         )
     if args.max_workers is not None and args.max_workers < 1:
         parser.error("--max-workers must be greater than 0")
+    if args.limit and args.max_workers is not None:
+        parser.error("--limit cannot be combined with --max-workers")
     if args.no_archive_checksum and not args.archive:
         parser.error("--no-archive-checksum requires --archive")
     if args.archive_dir and args.archive_path:
@@ -285,7 +292,9 @@ def download_model(args: argparse.Namespace, paths: ArchivePaths) -> None:
         command.extend(["--exclude", pattern])
     if args.force_download:
         command.append("--force-download")
-    if args.max_workers is not None:
+    if args.limit:
+        command.extend(["--max-workers", "1"])
+    elif args.max_workers is not None:
         command.extend(["--max-workers", str(args.max_workers)])
 
     run_command(command)
