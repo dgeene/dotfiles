@@ -1,5 +1,8 @@
 # Dotfiles
 
+Model downloads can be bundled with repository provenance and SHA-256 hashes
+using [archive-hf-model](scripts/ai/README.md#usage).
+
 Machine specific configurations
 
 To avoid turning a .zshrc into a giant pile of conditionals...

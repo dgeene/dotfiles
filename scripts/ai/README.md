@@ -139,6 +139,45 @@ mean every local model engine can load it directly.
 
 ### Usage
 
+Downloads automatically create `archive-provenance/download-<unique-id>.json`
+inside the model directory. These records are included in NAS syncs and tar
+archives. Downloading requires Python 3.9+ and an `hf` CLI supporting
+`hf models info --expand --format json`; authentication uses the CLI's normal
+login or `HF_TOKEN`. Archive and sync stages still work offline.
+
+Each record contains the repository URL, requested revision, resolved commit,
+commit-pinned file URLs, UTC download start/completion times, file sizes and
+locally computed SHA-256 hashes. The download itself is pinned to that commit.
+Hashing reads each selected file in full and can take time for large models.
+Times describe the current successful download invocation, including cache
+reuse, rather than claiming to know when cached bytes were first downloaded.
+
+Per-file format information distinguishes `quantized_gguf` (quantization label
+recognized in the filename), `gguf` (quantization unknown), and
+`source_format_weights` (such as safetensors or PyTorch weights). Classification
+is based on filenames, not tensor inspection: source-format weights can also
+be quantized, adapters, or derivatives. The model card's declared base model
+and base-model relation are saved when available, without claiming verified
+lineage. GGUF's embedded metadata stays in the original file.
+
+Records cover only repository files selected by that invocation, not cache
+files or unrelated files already in the directory. Earlier records are retained;
+their hashes describe earlier downloads and may differ from files subsequently
+updated in place. Failed downloads do not publish a new record. Existing
+downloads need a successful `--download` run to gain provenance; `--archive`
+alone cannot reconstruct their original download date or revision.
+
+For a single quantization plus its model card:
+
+```shell
+./archive-hf-model \
+  mradermacher/Hermes-3-Llama-3.1-70B-Uncensored-i1-GGUF \
+  Hermes-3-70B-i1-Q4_K_S \
+  --include 'Hermes-3-Llama-3.1-70B-Uncensored.i1-Q4_K_S.gguf' \
+  --include 'README.md' \
+  --download --archive
+```
+
 ```shell
 ./archive-hf-model Qwen/Qwen3-8B Qwen3-8B
 # saves to

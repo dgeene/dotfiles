@@ -8,18 +8,24 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import quote, urlsplit
 
 
 DEFAULT_NAS_ROOT = "/mnt/ai-models"
 DEFAULT_LOCAL_ROOT = "/tmp/hf-model-downloads"
+PROVENANCE_DIR = "archive-provenance"
 
 
 @dataclass(frozen=True)
@@ -62,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     stage_group.add_argument(
         "--download",
         action="store_true",
-        help="Download the Hugging Face repository into the local staging directory.",
+        help="Download at a pinned commit and bundle provenance JSON with SHA-256 file hashes.",
     )
     stage_group.add_argument(
         "--sync",
@@ -275,6 +281,20 @@ def run_command(command: list[str]) -> None:
 
 def download_model(args: argparse.Namespace, paths: ArchivePaths) -> None:
     require_command("hf")
+    info = model_info(args)
+    commit = info["sha"]
+    names = selected_repo_files(info, args)
+    if not names:
+        raise SystemExit("ERROR: no repository files match the download filters")
+    if any(name.split("/", 1)[0] == PROVENANCE_DIR for name in names):
+        raise SystemExit(f"ERROR: repository uses reserved directory {PROVENANCE_DIR}")
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+    parsed = urlsplit(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise SystemExit("ERROR: HF_ENDPOINT must be an HTTP(S) URL without credentials, query, or fragment")
+    provenance_dir = paths.local_model / PROVENANCE_DIR
+    if provenance_dir.is_symlink() or (provenance_dir.exists() and not provenance_dir.is_dir()):
+        raise SystemExit(f"ERROR: expected a regular provenance directory: {provenance_dir}")
     paths.local_model.parent.mkdir(parents=True, exist_ok=True)
 
     print_section("Downloading Hugging Face model")
@@ -284,8 +304,7 @@ def download_model(args: argparse.Namespace, paths: ArchivePaths) -> None:
 
     command = ["hf", "download", args.hf_repo, "--local-dir", str(paths.local_model)]
 
-    if args.revision:
-        command.extend(["--revision", args.revision])
+    command.extend(["--revision", commit])
     for pattern in args.include:
         command.extend(["--include", pattern])
     for pattern in args.exclude:
@@ -297,7 +316,101 @@ def download_model(args: argparse.Namespace, paths: ArchivePaths) -> None:
     elif args.max_workers is not None:
         command.extend(["--max-workers", str(args.max_workers)])
 
+    started_at = datetime.now(timezone.utc).isoformat()
     run_command(command)
+    completed_at = datetime.now(timezone.utc).isoformat()
+    write_provenance(args, paths, info, names, endpoint, started_at, completed_at)
+
+
+def model_info(args: argparse.Namespace) -> dict:
+    """Use the CLI's authentication and endpoint settings, including cached login."""
+    command = ["hf", "models", "info", args.hf_repo, "--revision", args.revision or "main",
+               "--expand", "sha,siblings,cardData", "--format", "json"]
+    result = subprocess.run(command, check=True, stdout=subprocess.PIPE, text=True)
+    try:
+        info = json.loads(result.stdout)
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", info["sha"]) or not isinstance(info["siblings"], list):
+            raise ValueError("missing commit or file list")
+    except (ValueError, KeyError, TypeError) as error:
+        raise SystemExit("ERROR: hf models info did not return a valid commit and file list") from error
+    return info
+
+
+def selected_repo_files(info: dict, args: argparse.Namespace) -> list[str]:
+    def matches(name: str, patterns: list[str]) -> bool:
+        return any(fnmatchcase(name, p + "*" if p.endswith("/") else p) for p in patterns)
+
+    names = []
+    for sibling in info["siblings"]:
+        name = sibling["rfilename"]
+        if not name or name.startswith("/") or "\\" in name or any(p in {"", ".", ".."} for p in name.split("/")):
+            raise SystemExit("ERROR: unsafe filename returned by Hugging Face")
+        if (not args.include or matches(name, args.include)) and not matches(name, args.exclude):
+            names.append(name)
+    return sorted(set(names))
+
+
+def file_format(name: str) -> dict:
+    """Describe packaging without claiming every non-GGUF model is unquantized."""
+    suffix = Path(name).suffix.lower()
+    if suffix == ".gguf":
+        quant = re.search(r"(?:^|[.\-_])((?:IQ|Q|TQ)\d[0-9A-Z_]*)(?=[.\-]|$)", Path(name).name.upper())
+        return {"format": "gguf", "model_kind": "quantized_gguf" if quant else "gguf",
+                "quantization": quant.group(1) if quant else None,
+                "classification_basis": "filename; embedded tensor types not inspected"}
+    if suffix in {".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".h5", ".msgpack"}:
+        return {"format": suffix[1:], "model_kind": "source_format_weights",
+                "quantization": None,
+                "classification_basis": "file extension; original-source and quantization status unverified"}
+    return {"format": suffix[1:] or "unknown", "model_kind": "supporting_file"}
+
+
+def write_provenance(args: argparse.Namespace, paths: ArchivePaths, info: dict,
+                     names: list[str], endpoint: str, started_at: str, completed_at: str) -> None:
+    print_section("Recording download provenance and SHA-256 hashes")
+    source_url = f"{endpoint}/{quote(args.hf_repo, safe='/')}"
+    files = []
+    for name in names:
+        path = paths.local_model / name
+        if not path.is_file() or not path.resolve().is_relative_to(paths.local_model):
+            raise SystemExit(f"ERROR: downloaded file missing or outside model directory: {name}")
+        files.append({"path": name, "size_bytes": path.stat().st_size,
+                      "sha256": sha256_file(path),
+                      "source_url": f"{source_url}/resolve/{info['sha']}/{quote(name, safe='/')}",
+                      **file_format(name)})
+    kinds = sorted({f["model_kind"] for f in files if f["model_kind"] != "supporting_file"})
+    card = info.get("cardData") or info.get("card_data") or {}
+    manifest = {
+        "schema_version": 1, "repository": args.hf_repo, "source_url": source_url,
+        "requested_revision": args.revision or "main", "repository_commit": info["sha"],
+        "revision_url": f"{source_url}/tree/{info['sha']}",
+        "download_started_at": started_at, "download_completed_at": completed_at,
+        "timestamp_note": "UTC times for this successful hf download invocation; files may be reused from cache",
+        "model_kinds": kinds or ["unknown"],
+        "declared_base_model": card.get("base_model"),
+        "declared_base_model_relation": card.get("base_model_relation"),
+        "include": args.include, "exclude": args.exclude,
+        "scope": "Only repository files selected in this invocation; excludes cache, provenance, and other pre-existing files",
+        "files": files,
+    }
+    directory = paths.local_model / PROVENANCE_DIR
+    directory.mkdir(exist_ok=True)
+    # Retain earlier download records. Publish only complete manifests.
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                     prefix=".pending-", suffix=".tmp", delete=False) as output:
+        pending = Path(output.name)
+        try:
+            json.dump(manifest, output, indent=2, ensure_ascii=False)
+            output.write("\n")
+        except BaseException:
+            pending.unlink(missing_ok=True)
+            raise
+    final = directory / (pending.stem.replace(".pending-", "download-") + ".json")
+    try:
+        pending.replace(final)
+    finally:
+        pending.unlink(missing_ok=True)
+    print(f"Provenance : {final}")
 
 
 def sync_to_nas(args: argparse.Namespace, paths: ArchivePaths) -> None:
