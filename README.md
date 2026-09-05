@@ -1,6 +1,7 @@
 # Dotfiles
 
-Model downloads can be bundled with repository provenance and SHA-256 hashes
+Model downloads are organized into source and GGUF inference directories,
+with repository provenance and SHA-256 hashes
 using [archive-hf-model](scripts/ai/README.md#usage).
 
 Machine specific configurations

@@ -26,6 +26,7 @@ from urllib.parse import quote, urlsplit
 DEFAULT_NAS_ROOT = "/mnt/ai-models"
 DEFAULT_LOCAL_ROOT = "/tmp/hf-model-downloads"
 PROVENANCE_DIR = "archive-provenance"
+MODEL_LAYOUTS = {"source": Path("source/huggingface"), "gguf": Path("inference/gguf")}
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class ArchivePaths:
     checksum: Path
     local_archive: Path
     local_archive_checksum: Path
+    local_checksum: Path
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     stage_group.add_argument(
         "--download",
         action="store_true",
-        help="Download at a pinned commit and bundle provenance JSON with SHA-256 file hashes.",
+        help="Download at a pinned commit, bundle provenance JSON, and write local SHA-256 checksums.",
     )
     stage_group.add_argument(
         "--sync",
@@ -97,6 +99,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     path_group = parser.add_argument_group("paths")
+    path_group.add_argument(
+        "--layout",
+        choices=("auto", "source", "gguf"),
+        default="auto",
+        help=(
+            "Storage layout: auto uses inference/gguf for GGUF-only weights and "
+            "source/huggingface otherwise. Offline stages locate existing organized "
+            "directories; select a layout if both exist. Does not filter downloads."
+        ),
+    )
     path_group.add_argument(
         "--nas-root",
         type=Path,
@@ -198,6 +210,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--no-archive-checksum requires --archive")
     if args.archive_dir and args.archive_path:
         parser.error("--archive-dir cannot be combined with --archive-path")
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", args.hf_repo) or any(
+        part in {".", ".."} for part in args.hf_repo.split("/")
+    ):
+        parser.error("hf_repo must be an owner/repository ID, not a URL or file path")
+    if args.model_name and (
+        args.model_name in {".", ".."} or "/" in args.model_name or "\\" in args.model_name
+    ):
+        parser.error("model_name must be a single directory name")
 
     return args
 
@@ -240,15 +260,17 @@ def resolve_path(path: Path) -> Path:
     return path.expanduser().resolve()
 
 
-def build_paths(args: argparse.Namespace, model_name: str) -> ArchivePaths:
+def build_paths(args: argparse.Namespace, model_name: str, layout: str = "source") -> ArchivePaths:
     org = repo_org(args.hf_repo)
+    relative = MODEL_LAYOUTS[layout] / org / model_name
+    checksum_relative = Path("metadata/checksums") / MODEL_LAYOUTS[layout] / org / f"{model_name}.sha256"
     local_model = (
         args.local_model_dir
         if args.local_model_dir is not None
-        else args.local_root / model_name
+        else args.local_root / relative
     )
-    nas_model = args.nas_root / "huggingface" / org / model_name
-    checksum = args.nas_root / "checksums" / "huggingface" / org / f"{model_name}.sha256"
+    nas_model = args.nas_root / relative
+    checksum = args.nas_root / checksum_relative
     archive_dir = args.archive_dir if args.archive_dir else local_model.parent
     local_archive = args.archive_path if args.archive_path else archive_dir / f"{model_name}.tar.zst"
     local_archive_checksum = Path(f"{local_archive}.sha256")
@@ -259,7 +281,64 @@ def build_paths(args: argparse.Namespace, model_name: str) -> ArchivePaths:
         checksum=resolve_path(checksum),
         local_archive=resolve_path(local_archive),
         local_archive_checksum=resolve_path(local_archive_checksum),
+        local_checksum=resolve_path(args.local_root / checksum_relative),
     )
+
+
+def infer_layout(names: Iterable[str]) -> str:
+    kinds = {file_format(name)["model_kind"] for name in names}
+    if kinds & {"gguf", "quantized_gguf"} and "source_format_weights" not in kinds:
+        return "gguf"
+    return "source"
+
+
+def local_file_names(root: Path) -> Iterable[str]:
+    return (
+        path.relative_to(root).as_posix() for path in iter_files(root)
+        if path.relative_to(root).parts[0] not in {".cache", PROVENANCE_DIR}
+    )
+
+
+def choose_layout(args: argparse.Namespace, stages: set[str], model_name: str,
+                  info: dict | None = None) -> str:
+    if args.layout != "auto":
+        layout = args.layout
+    elif info is not None:
+        layout = infer_layout(selected_repo_files(info, args))
+    elif args.local_model_dir is not None and stages & {"sync", "archive"}:
+        layout = infer_layout(local_file_names(resolve_path(args.local_model_dir)))
+    elif stages == {"archive_checksum"} and (args.archive_path or args.archive_dir):
+        # An explicitly located archive does not depend on the model layout.
+        layout = "source"
+    else:
+        candidates = []
+        for candidate in MODEL_LAYOUTS:
+            paths = build_paths(args, model_name, candidate)
+            if stages & {"sync", "archive"}:
+                exists = paths.local_model.is_dir()
+            elif "checksum" in stages:
+                exists = paths.nas_model.is_dir()
+            else:
+                exists = paths.local_archive.is_file()
+            if exists:
+                candidates.append(candidate)
+        if len(candidates) > 1:
+            raise SystemExit("ERROR: both layouts exist; choose --layout source or --layout gguf")
+        layout = candidates[0] if candidates else "source"
+
+    if layout == "gguf":
+        paths = build_paths(args, model_name, layout)
+        names = list(selected_repo_files(info, args)) if info is not None else []
+        # Avoid mixing source weights into an existing inference directory.
+        for root in (paths.local_model, paths.nas_model):
+            if root.is_dir():
+                names.extend(local_file_names(root))
+        if any(file_format(name)["model_kind"] == "source_format_weights" for name in names):
+            raise SystemExit(
+                "ERROR: source-format weights found in selection or directory; "
+                "use --layout source or a separate GGUF-only selection/directory"
+            )
+    return layout
 
 
 def print_section(title: str) -> None:
@@ -279,9 +358,10 @@ def run_command(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
-def download_model(args: argparse.Namespace, paths: ArchivePaths) -> None:
+def download_model(args: argparse.Namespace, paths: ArchivePaths,
+                   info: dict | None = None) -> dict[str, str]:
     require_command("hf")
-    info = model_info(args)
+    info = model_info(args) if info is None else info
     commit = info["sha"]
     names = selected_repo_files(info, args)
     if not names:
@@ -319,7 +399,7 @@ def download_model(args: argparse.Namespace, paths: ArchivePaths) -> None:
     started_at = datetime.now(timezone.utc).isoformat()
     run_command(command)
     completed_at = datetime.now(timezone.utc).isoformat()
-    write_provenance(args, paths, info, names, endpoint, started_at, completed_at)
+    return write_provenance(args, paths, info, names, endpoint, started_at, completed_at)
 
 
 def model_info(args: argparse.Namespace) -> dict:
@@ -366,7 +446,7 @@ def file_format(name: str) -> dict:
 
 
 def write_provenance(args: argparse.Namespace, paths: ArchivePaths, info: dict,
-                     names: list[str], endpoint: str, started_at: str, completed_at: str) -> None:
+                     names: list[str], endpoint: str, started_at: str, completed_at: str) -> dict[str, str]:
     print_section("Recording download provenance and SHA-256 hashes")
     source_url = f"{endpoint}/{quote(args.hf_repo, safe='/')}"
     files = []
@@ -411,6 +491,7 @@ def write_provenance(args: argparse.Namespace, paths: ArchivePaths, info: dict,
     finally:
         pending.unlink(missing_ok=True)
     print(f"Provenance : {final}")
+    return {file["path"]: file["sha256"] for file in files}
 
 
 def sync_to_nas(args: argparse.Namespace, paths: ArchivePaths) -> None:
@@ -456,21 +537,42 @@ def checksum_name(root: Path, path: Path) -> str:
 
 
 def write_checksums(paths: ArchivePaths) -> None:
-    if not paths.nas_model.is_dir():
-        raise SystemExit(f"ERROR: NAS model directory does not exist: {paths.nas_model}")
+    write_directory_checksums(paths.nas_model, paths.checksum)
 
-    paths.checksum.parent.mkdir(parents=True, exist_ok=True)
+
+def write_directory_checksums(root: Path, destination: Path,
+                              known_hashes: dict[str, str] | None = None) -> None:
+    if not root.is_dir():
+        raise SystemExit(f"ERROR: model directory does not exist: {root}")
+    if destination.is_relative_to(root):
+        raise SystemExit("ERROR: checksum manifest must be outside the model directory")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
 
     print_section("Generating SHA-256 checksums")
-    print(f"Model    : {paths.nas_model}")
-    print(f"Checksum : {paths.checksum}")
+    print(f"Model    : {root}")
+    print(f"Checksum : {destination}")
     print()
 
-    with paths.checksum.open("w", encoding="utf-8") as checksum_file:
-        for path in iter_files(paths.nas_model):
-            checksum_file.write(
-                f"{sha256_file(path)}  {checksum_name(paths.nas_model, path)}\n"
-            )
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=destination.parent,
+                                     prefix=".checksum-", delete=False) as checksum_file:
+        pending = Path(checksum_file.name)
+        try:
+            for path in iter_files(root):
+                relative = path.relative_to(root).as_posix()
+                digest = (known_hashes or {}).get(relative) or sha256_file(path)
+                name = checksum_name(root, path)
+                # GNU checksum format escapes filenames containing newlines/backslashes.
+                escaped = "\\" in name or "\n" in name
+                name = name.replace("\\", "\\\\").replace("\n", "\\n")
+                checksum_file.write(("\\" if escaped else "") + f"{digest}  {name}\n")
+        except BaseException:
+            pending.unlink(missing_ok=True)
+            raise
+    try:
+        pending.replace(destination)
+    finally:
+        pending.unlink(missing_ok=True)
 
 
 def create_local_archive(paths: ArchivePaths) -> None:
@@ -535,6 +637,8 @@ def summarize(paths: ArchivePaths, stages: set[str]) -> None:
     print(f"Stages   : {stage_list}")
     if "download" in stages or "sync" in stages or "archive" in stages:
         print(f"Local    : {paths.local_model}")
+    if "download" in stages:
+        print(f"Local checksum : {paths.local_checksum}")
     if "sync" in stages or "checksum" in stages:
         print(f"Model    : {paths.nas_model}")
         print(f"Checksum : {paths.checksum}")
@@ -553,10 +657,17 @@ def main() -> int:
     args = parse_args()
     stages = selected_stages(args)
     model_name = args.model_name or default_model_name(args.hf_repo)
-    paths = build_paths(args, model_name)
+    info = None
+    if "download" in stages:
+        require_command("hf")
+        info = model_info(args)
+    layout = choose_layout(args, stages, model_name, info)
+    paths = build_paths(args, model_name, layout)
+    print(f"Layout   : {MODEL_LAYOUTS[layout]}")
 
     if "download" in stages:
-        download_model(args, paths)
+        hashes = download_model(args, paths, info)
+        write_directory_checksums(paths.local_model, paths.local_checksum, hashes)
     if "sync" in stages:
         sync_to_nas(args, paths)
     if "checksum" in stages:

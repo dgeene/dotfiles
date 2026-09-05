@@ -26,76 +26,95 @@ This gives you a local staging area so that a partially failed download doesn't 
 Hugging Face
      │
      ▼
-~/ai/downloads/
+/tmp/hf-model-downloads/
      │
      │ rsync
      ▼
-NAS:/mnt/ai-models/huggingface/
+NAS:/mnt/ai-models/
      │
      ├── checksum
      │
      └── optional archive
 ```
 
-### Recommended archive layout
+### Organized storage layout
+
+The same relative layout is used beneath both roots: `/tmp/hf-model-downloads`
+locally and `/mnt/ai-models` on the NAS. Override them with `--local-root` /
+`HF_MODEL_DOWNLOAD_ROOT` and `--nas-root` / `AI_MODELS_NAS_ROOT`.
 
 ```text
-/mnt/ai-models/
-├── README.md
-├── huggingface/
-│   ├── Qwen/
-│   │   ├── Qwen3-30B-A3B/
-│   │   └── Qwen3-8B/
-│   │
-│   ├── meta-llama/
-│   │   └── Llama-3.3-70B-Instruct/
-│   │
-│   └── mistralai/
-│       └── Mistral-Small-3.1-24B-Instruct/
-│
-├── gguf/
-│   ├── Qwen/
-│   ├── Llama/
-│   └── Mistral/
-│
-├── ollama/
-│   └── manifests/
-│
-├── archives/
-│   ├── huggingface/
-│   └── gguf/
-│
-└── checksums/
-    ├── huggingface/
-    └── gguf/
+<root>/
+├── source/
+│   └── huggingface/<owner>/<model>/
+│       ├── config.json
+│       ├── tokenizer.json
+│       ├── model.safetensors
+│       └── archive-provenance/
+├── inference/
+│   └── gguf/<owner>/<model>/
+│       ├── model-Q4_K_M.gguf
+│       ├── model-Q8_0.gguf
+│       ├── README.md
+│       └── archive-provenance/
+└── metadata/
+    └── checksums/
+        ├── source/huggingface/<owner>/<model>.sha256
+        └── inference/gguf/<owner>/<model>.sha256
 ```
 
-Use the top-level directories by purpose:
+Directories are created as needed. Automatic routing inspects the repository
+file list after applying `--include` and `--exclude`, before downloading:
 
-```text
-huggingface/   upstream-style Hugging Face repository mirrors
-gguf/          curated runtime-ready GGUF files for local inference engines
-ollama/        Ollama-specific manifests, blobs, or imports
-archives/      compressed or cold-storage copies
-checksums/     checksum manifests for stored models and artifacts
+- GGUF weights with supporting files go to `inference/gguf`.
+- Selections with recognized source-format weights go to `source/huggingface`.
+- Mixed selections (source weights plus GGUF) and unrecognized/document-only
+  selections stay together under `source/huggingface`, prioritizing preservation
+  of the repository. Files are not automatically split or discarded.
+
+Use `--layout source` to explicitly preserve a repository or `--layout gguf` to
+select the inference layout. Layout flags do not filter files; GGUF layout
+rejects selections or existing model directories containing recognized
+source-format weights. Use download filters to select just the weights you want.
+This organization does not certify that source-format weights are original or
+unquantized.
+
+The owner is the actual download repository's owner, including quantization
+publishers. The model directory defaults to the repository name; the optional
+`model_name` argument can group quantizations from that repository under a
+shorter name. Repeated downloads into that directory retain other quantizations.
+Keep different publishers in their own owner directories to preserve provenance.
+
+Offline sync/archive stages locate the existing organized local directory;
+checksum-only locates the NAS directory. If both layouts exist for the same
+owner/model, select `--layout source` or `--layout gguf`. No Hub request is needed.
+`--local-model-dir` still overrides the local model location exactly; offline
+sync/archive infer its layout from its files unless `--layout` is specified.
+Local checksum files still go beneath `--local-root/metadata/checksums`.
+
+Existing downloads in the old flat layout are not moved automatically. To copy
+one into the organized NAS layout:
+
+```shell
+./archive-hf-model Qwen/Qwen3-8B \
+  --local-model-dir /tmp/hf-model-downloads/Qwen3-8B \
+  --layout source --sync --checksum
 ```
 
-A GGUF file may originally come from a Hugging Face repository, but it can still
-be useful to keep a separate `gguf/` area for hand-picked files intended to be
-loaded directly by LM Studio, llama.cpp, or similar tools. As a rule of thumb,
-store full Hub repository downloads under `huggingface/`; store selected,
-runtime-ready `.gguf` artifacts under `gguf/`.
+Sync uses rsync to copy files, retaining the local source. Preserve
+`source/huggingface` when the original model matters; GGUF copies are additional
+inference artifacts.
 
 ### Model format compatibility
 
 Hugging Face is a hosting platform and repository layout, not a single runtime
-format. A model stored under `huggingface/` may still contain files meant for
+format. A model stored under `source/huggingface/` may still contain files meant for
 different engines.
 
 Check the files before trying to load a model from the NAS:
 
 ```shell
-find /mnt/ai-models/huggingface/<org>/<model> -maxdepth 2 -type f
+find /mnt/ai-models/source/huggingface/<org>/<model> -maxdepth 2 -type f
 ```
 
 Common patterns:
@@ -148,7 +167,13 @@ login or `HF_TOKEN`. Archive and sync stages still work offline.
 Each record contains the repository URL, requested revision, resolved commit,
 commit-pinned file URLs, UTC download start/completion times, file sizes and
 locally computed SHA-256 hashes. The download itself is pinned to that commit.
-Hashing reads each selected file in full and can take time for large models.
+Each successful download also writes a local checksum manifest under
+`metadata/checksums/<layout>/<owner>/<model>.sha256`, covering the whole current
+model directory, including provenance and retained files. Selected files' hashes
+are reused from provenance generation. The NAS `--checksum` stage independently
+hashes the NAS copy into the equivalent NAS path. Run checksum verification from
+the corresponding model directory. Hashing reads files in full and can take time
+for large models.
 Times describe the current successful download invocation, including cache
 reuse, rather than claiming to know when cached bytes were first downloaded.
 
@@ -181,7 +206,7 @@ For a single quantization plus its model card:
 ```shell
 ./archive-hf-model Qwen/Qwen3-8B Qwen3-8B
 # saves to
-# /mnt/ai-models/huggingface/Qwen/Qwen3-8B/
+# /mnt/ai-models/source/huggingface/Qwen/Qwen3-8B/
 ```
 
 Run only selected stages by passing one or more stage flags. If no stage flags
@@ -207,7 +232,7 @@ the download stage.
 
 # Use a local model directory outside the default staging root
 ./archive-hf-model Qwen/Qwen3-8B Qwen3-8B \
-    --local-model-dir ~/ai/downloads/Qwen3-8B \
+    --local-model-dir /tmp/hf-model-downloads/Qwen3-8B \
     --sync \
     --checksum
 ```
@@ -222,8 +247,8 @@ For manual copying, the archive stage writes a local `.tar.zst` next to the
 local model directory by default, plus a matching `.sha256` file:
 
 ```text
-/tmp/hf-model-downloads/Qwen3-8B.tar.zst
-/tmp/hf-model-downloads/Qwen3-8B.tar.zst.sha256
+/tmp/hf-model-downloads/source/huggingface/Qwen/Qwen3-8B.tar.zst
+/tmp/hf-model-downloads/source/huggingface/Qwen/Qwen3-8B.tar.zst.sha256
 ```
 
 Copy both files to the NAS, then verify the archive from the directory that
@@ -235,16 +260,16 @@ sha256sum -c Qwen3-8B.tar.zst.sha256
 
 Verifying the entire model
 ```shell
-cd /mnt/ai-models/huggingface/Qwen/Qwen3-8B
+cd /mnt/ai-models/source/huggingface/Qwen/Qwen3-8B
 sha256sum -c \
-    /mnt/ai-models/checksums/huggingface/Qwen/Qwen3-8B.sha256
+    /mnt/ai-models/metadata/checksums/source/huggingface/Qwen/Qwen3-8B.sha256
 ```
 
 For models you don't expect to use for a while, you could archive them:
 ```shell
 tar --zstd -cvf \
     /mnt/ai-models/archives/huggingface/Qwen3-8B.tar.zst \
-    -C /mnt/ai-models/huggingface/Qwen \
+    -C /mnt/ai-models/source/huggingface/Qwen \
     Qwen3-8B
 ```
 Then potentially remove the directory after verifying the archive.
@@ -257,5 +282,5 @@ tar --zstd -tf Qwen3-8B.tar.zst
 And restore:
 ```shell
 tar --zstd -xvf Qwen3-8B.tar.zst \
-    -C /mnt/ai-models/huggingface/Qwen
+    -C /mnt/ai-models/source/huggingface/Qwen
 ```
