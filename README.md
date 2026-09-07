@@ -1,8 +1,9 @@
 # Dotfiles
 
-Model downloads are organized into source and GGUF inference directories,
-with repository provenance and SHA-256 hashes
-using [archive-hf-model](scripts/ai/README.md#usage).
+Model archives preserve immutable repository revisions, verified NAS/backup
+copies, and separate GGUF conversions with reproducible recipe records using
+[archive-hf-model](scripts/ai/README.md). Optional tar archives include content
+verification and restore guidance; existing model directories are left in place.
 
 Machine specific configurations
 

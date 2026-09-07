@@ -15,7 +15,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+import tarfile
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -24,8 +26,9 @@ from urllib.parse import quote, urlsplit
 
 
 DEFAULT_NAS_ROOT = "/mnt/ai-models"
-DEFAULT_LOCAL_ROOT = "/tmp/hf-model-downloads"
+DEFAULT_LOCAL_ROOT = str(Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "hf-model-archives")
 PROVENANCE_DIR = "archive-provenance"
+SNAPSHOT = f"{PROVENANCE_DIR}/snapshot.json"
 MODEL_LAYOUTS = {"source": Path("source/huggingface"), "gguf": Path("inference/gguf")}
 
 
@@ -80,12 +83,12 @@ def parse_args() -> argparse.Namespace:
     stage_group.add_argument(
         "--checksum",
         action="store_true",
-        help="Generate the SHA-256 checksum manifest from the NAS copy.",
+        help="Verify the NAS snapshot and create missing checksums; never replace an existing baseline.",
     )
     stage_group.add_argument(
         "--archive",
         action="store_true",
-        help="Create a local .tar.zst archive from the local model directory.",
+        help="Create and verify an optional local tar archive (--compression none or zstd).",
     )
     stage_group.add_argument(
         "--archive-checksum",
@@ -125,8 +128,8 @@ def parse_args() -> argparse.Namespace:
         "--local-model-dir",
         type=Path,
         help=(
-            "Existing or desired local model directory. Use this when the model "
-            "was already downloaded somewhere outside --local-root."
+            "Exact new download directory or existing sealed snapshot for offline stages. "
+            "With --record-conversion, the existing GGUF output directory to import."
         ),
     )
     path_group.add_argument(
@@ -142,14 +145,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "Specific local tar archive path. Defaults to "
-            "<archive-dir>/<model-name>.tar.zst."
+            "<archive-dir>/<model-name>-<commit>[-<conversion>].tar[.zst]."
         ),
     )
 
     download_group = parser.add_argument_group("download options")
     download_group.add_argument(
         "--revision",
-        help="Git revision, branch, tag, or commit to download from Hugging Face.",
+        help="Download branch/tag/commit; offline stages require the full commit SHA.",
     )
     download_group.add_argument(
         "--include",
@@ -185,8 +188,19 @@ def parse_args() -> argparse.Namespace:
     rsync_group.add_argument(
         "--rsync-delete",
         action="store_true",
-        help="Delete extraneous files from the NAS destination during rsync.",
+        help="Retired: rejected because snapshots are immutable.",
     )
+
+    stage_group.add_argument("--verify", action="store_true", help="Verify a published snapshot against its saved checksums.")
+    stage_group.add_argument("--verify-target", choices=("local", "nas", "backup"), default="nas")
+    stage_group.add_argument("--record-conversion", type=Path, metavar="RECIPE.json", help="Import existing GGUF outputs and preserve a conversion recipe (never executes it).")
+    stage_group.add_argument("--verify-archive", action="store_true", help="Verify archive checksum and all embedded snapshot file hashes without extracting.")
+    path_group.add_argument("--backup-root", type=Path, help="Also publish a verified independent directory copy beneath this existing root.")
+    path_group.add_argument("--conversion-name", help="Select a locally converted artifact for offline stages.")
+    path_group.add_argument("--compression", choices=("none", "zstd"), default="zstd", help="Optional tar packaging compression.")
+    download_group.add_argument("--skip-upstream-verification", action="store_true", help="Skip hf cache verify; local and transfer checks remain mandatory.")
+    download_group.add_argument("--require-source-complete", action="store_true", help="Fail on source readiness warnings; does not certify converter support.")
+    download_group.add_argument("--base-model-dir", action="append", type=Path, default=[], help="Verified base-model snapshot dependency; repeat for multiple bases.")
 
     args = parser.parse_args()
 
@@ -196,6 +210,9 @@ def parse_args() -> argparse.Namespace:
         args.checksum,
         args.archive,
         args.archive_checksum,
+        args.verify,
+        args.record_conversion,
+        args.verify_archive,
     ]
     if args.all and any(selected_stages):
         parser.error(
@@ -210,6 +227,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--no-archive-checksum requires --archive")
     if args.archive_dir and args.archive_path:
         parser.error("--archive-dir cannot be combined with --archive-path")
+    if args.rsync_delete:
+        parser.error("--rsync-delete is incompatible with immutable snapshots; use a separate snapshot")
+    if args.record_conversion and (args.download or args.all or not args.local_model_dir):
+        parser.error("--record-conversion requires --local-model-dir and cannot be combined with download")
+    if args.conversion_name and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.conversion_name):
+        parser.error("--conversion-name must be a simple directory name")
+    if args.verify_target == "backup" and not args.backup_root:
+        parser.error("--verify-target backup requires --backup-root")
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", args.hf_repo) or any(
         part in {".", ".."} for part in args.hf_repo.split("/")
     ):
@@ -229,6 +254,9 @@ def selected_stages(args: argparse.Namespace) -> set[str]:
         or args.checksum
         or args.archive
         or args.archive_checksum
+        or args.verify
+        or args.record_conversion
+        or args.verify_archive
     ):
         return {"download", "sync", "checksum"}
 
@@ -245,6 +273,12 @@ def selected_stages(args: argparse.Namespace) -> set[str]:
             stages.add("archive_checksum")
     if args.archive_checksum:
         stages.add("archive_checksum")
+    if args.verify:
+        stages.add("verify")
+    if args.record_conversion:
+        stages.add("conversion")
+    if args.verify_archive:
+        stages.add("verify_archive")
     return stages
 
 
@@ -263,7 +297,13 @@ def resolve_path(path: Path) -> Path:
 def build_paths(args: argparse.Namespace, model_name: str, layout: str = "source") -> ArchivePaths:
     org = repo_org(args.hf_repo)
     relative = MODEL_LAYOUTS[layout] / org / model_name
-    checksum_relative = Path("metadata/checksums") / MODEL_LAYOUTS[layout] / org / f"{model_name}.sha256"
+    commit = getattr(args, "snapshot_commit", None) or args.revision
+    if not commit or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise SystemExit("ERROR: offline stages require --revision with a full commit SHA (or a sealed --local-model-dir)")
+    relative /= commit
+    if layout == "gguf":
+        relative /= args.conversion_name or "download"
+    checksum_relative = Path("metadata/checksums") / relative.parent / f"{relative.name}.sha256"
     local_model = (
         args.local_model_dir
         if args.local_model_dir is not None
@@ -272,10 +312,12 @@ def build_paths(args: argparse.Namespace, model_name: str, layout: str = "source
     nas_model = args.nas_root / relative
     checksum = args.nas_root / checksum_relative
     archive_dir = args.archive_dir if args.archive_dir else local_model.parent
-    local_archive = args.archive_path if args.archive_path else archive_dir / f"{model_name}.tar.zst"
+    extension = ".tar.zst" if args.compression == "zstd" else ".tar"
+    artifact = f"-{relative.name}" if layout == "gguf" else ""
+    local_archive = args.archive_path if args.archive_path else archive_dir / f"{model_name}-{commit}{artifact}{extension}"
     local_archive_checksum = Path(f"{local_archive}.sha256")
 
-    return ArchivePaths(
+    paths = ArchivePaths(
         local_model=resolve_path(local_model),
         nas_model=resolve_path(nas_model),
         checksum=resolve_path(checksum),
@@ -283,6 +325,10 @@ def build_paths(args: argparse.Namespace, model_name: str, layout: str = "source
         local_archive_checksum=resolve_path(local_archive_checksum),
         local_checksum=resolve_path(args.local_root / checksum_relative),
     )
+    for root, manifest in ((paths.local_model, paths.local_checksum), (paths.nas_model, paths.checksum)):
+        if manifest.is_relative_to(root):
+            raise SystemExit("ERROR: checksum files must be outside snapshot directories; choose a separate --local-root")
+    return paths
 
 
 def infer_layout(names: Iterable[str]) -> str:
@@ -305,9 +351,9 @@ def choose_layout(args: argparse.Namespace, stages: set[str], model_name: str,
         layout = args.layout
     elif info is not None:
         layout = infer_layout(selected_repo_files(info, args))
-    elif args.local_model_dir is not None and stages & {"sync", "archive"}:
+    elif args.local_model_dir is not None and stages & {"sync", "archive", "verify"}:
         layout = infer_layout(local_file_names(resolve_path(args.local_model_dir)))
-    elif stages == {"archive_checksum"} and (args.archive_path or args.archive_dir):
+    elif stages <= {"archive_checksum", "verify_archive"} and args.archive_path:
         # An explicitly located archive does not depend on the model layout.
         layout = "source"
     else:
@@ -318,6 +364,11 @@ def choose_layout(args: argparse.Namespace, stages: set[str], model_name: str,
                 exists = paths.local_model.is_dir()
             elif "checksum" in stages:
                 exists = paths.nas_model.is_dir()
+            elif "verify" in stages:
+                root = paths.local_model if args.verify_target == "local" else paths.nas_model
+                if args.verify_target == "backup":
+                    root = resolve_path(args.backup_root) / paths.nas_model.relative_to(resolve_path(args.nas_root))
+                exists = root.is_dir()
             else:
                 exists = paths.local_archive.is_file()
             if exists:
@@ -358,6 +409,175 @@ def run_command(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
+def read_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("expected an object")
+        return value
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"ERROR: cannot read JSON object: {path}: {error}") from error
+
+
+def write_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8") as output:
+        json.dump(value, output, indent=2, ensure_ascii=False)
+        output.write("\n")
+
+
+def inventory(root: Path) -> dict[str, str]:
+    return {p.relative_to(root).as_posix(): sha256_file(p) for p in iter_files(root)}
+
+
+def verify_snapshot(root: Path, expected: dict[str, str] | None = None) -> dict:
+    manifest = read_json(root / SNAPSHOT)
+    if (manifest.get("schema_version") != 1 or not isinstance(manifest.get("files"), dict)
+            or not manifest["files"] or not isinstance(manifest.get("repository_commit"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}", manifest["repository_commit"])
+            or manifest.get("layout") not in MODEL_LAYOUTS
+            or not isinstance(manifest.get("repository"), str)):
+        raise SystemExit(f"ERROR: invalid snapshot manifest: {root}")
+    actual = inventory(root)
+    contents = {name: digest for name, digest in actual.items() if name != SNAPSHOT}
+    if contents != manifest["files"] or (expected is not None and actual != expected):
+        raise SystemExit(f"ERROR: snapshot verification failed (changed, missing, or extra files): {root}")
+    return manifest
+
+
+def seal_snapshot(root: Path, args: argparse.Namespace, **metadata) -> None:
+    write_json(root / SNAPSHOT, {
+        "schema_version": 1, "repository": args.hf_repo,
+        "repository_commit": args.snapshot_commit,
+        "layout": args.snapshot_layout,
+        "conversion_name": args.conversion_name,
+        **metadata, "files": inventory(root),
+    })
+
+
+@contextmanager
+def publication_lock(destination: Path):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    lock = destination.parent / f".{destination.name}.lock"
+    try:
+        lock.mkdir()
+    except FileExistsError as error:
+        raise SystemExit(f"ERROR: snapshot is locked: {lock}; remove the empty lock only after confirming no writer is running") from error
+    try:
+        yield
+    finally:
+        lock.rmdir()
+
+
+def dependency_records(args: argparse.Namespace) -> list[dict]:
+    records = []
+    for directory in args.base_model_dir:
+        root = resolve_path(directory)
+        manifest = verify_snapshot(root)
+        records.append({"repository": manifest["repository"],
+                        "repository_commit": manifest["repository_commit"],
+                        "snapshot_sha256": sha256_file(root / SNAPSHOT)})
+    return records
+
+
+def assess_source(root: Path, info: dict, names: list[str], dependencies: list[dict]) -> dict:
+    """Structural checks only: never load weights or execute repository code."""
+    warnings = []
+    selected = set(names)
+    repo_files = {s["rfilename"] for s in info["siblings"]}
+    omitted = sorted(repo_files - selected)
+    if omitted:
+        warnings.append("Filtered snapshot: some repository files were omitted.")
+    # An index is a concrete dependency list, even for a filtered download.
+    for name in names:
+        if name.endswith((".safetensors.index.json", ".bin.index.json")):
+            index = read_json(root / name)
+            mapping = index.get("weight_map")
+            if not isinstance(mapping, dict) or not mapping:
+                raise SystemExit(f"ERROR: invalid weight index: {name}")
+            for shard in mapping.values():
+                if not isinstance(shard, str) or (Path(name).parent / shard).as_posix() not in selected:
+                    raise SystemExit(f"ERROR: missing referenced weight shard in {name}: {shard}")
+    source = infer_layout(names) == "source"
+    config = read_json(root / "config.json") if "config.json" in selected else {}
+    adapter = read_json(root / "adapter_config.json") if "adapter_config.json" in selected else {}
+    if source:
+        if "config.json" not in selected:
+            warnings.append("No root config.json; architecture/runtime compatibility needs review.")
+        if not any(Path(n).name in {"tokenizer.json", "tokenizer.model", "spiece.model", "vocab.json", "vocab.txt"} for n in names):
+            warnings.append("No recognized tokenizer vocabulary; archive its external dependency if needed.")
+        if not any(file_format(n)["model_kind"] == "source_format_weights" for n in names):
+            warnings.append("No recognized source weight files.")
+        if config.get("quantization_config"):
+            warnings.append("Model declares quantization; prefer original released precision for new quantizations.")
+        if adapter:
+            warnings.append("Adapter repository: base weights must be archived separately; this is not a standalone model.")
+    else:
+        warnings.append("GGUF inference artifact; this is not a source checkpoint for new quantizations.")
+    card = info.get("cardData") or info.get("card_data") or {}
+    base = adapter.get("base_model_name_or_path") or card.get("base_model")
+    bases = base if isinstance(base, list) else [base] if isinstance(base, str) else []
+    archived_bases = {d["repository"]: d["repository_commit"] for d in dependencies}
+    for base_id in bases:
+        if base_id not in archived_bases:
+            warnings.append(f"Declared base model has no explicitly archived dependency snapshot: {base_id}")
+        elif adapter.get("revision") and adapter["revision"] != archived_bases[base_id]:
+            warnings.append("Adapter base revision differs from archived commit or is an unresolved branch/tag.")
+    if not any(Path(n).name.lower().startswith(("license", "copying")) for n in names):
+        warnings.append("No license file found; review the model card and preserve applicable terms.")
+    if not any(Path(n).name.lower() == "readme.md" for n in names):
+        warnings.append("No model card README.md found.")
+    return {"scope": "Structural checks only; original precision, external dependency completeness and converter support are unverified",
+            "complete_repository": not omitted, "omitted_files": omitted,
+            "architectures": config.get("architectures"), "declared_dtype": config.get("torch_dtype", config.get("dtype")),
+            "quantization_config": config.get("quantization_config"),
+            "declared_base_model": base, "declared_base_revision": adapter.get("revision"),
+            "base_snapshots": dependencies, "warnings": warnings}
+
+
+def publish_download(args: argparse.Namespace, paths: ArchivePaths, info: dict) -> None:
+    names = selected_repo_files(info, args)
+    request = {"repository": args.hf_repo, "commit": info["sha"], "files": names,
+               "layout": args.snapshot_layout,
+               "upstream_verification": not args.skip_upstream_verification,
+               "base_snapshots": dependency_records(args)}
+    with publication_lock(paths.local_model):
+        if paths.local_model.exists():
+            manifest = verify_snapshot(paths.local_model)
+            if manifest.get("request") != request or args.force_download:
+                raise SystemExit("ERROR: immutable snapshot already exists with different options; use a different model_name")
+            if args.require_source_complete and manifest["source_assessment"]["warnings"]:
+                raise SystemExit("ERROR: existing snapshot has source readiness warnings")
+            print(f"Verified existing snapshot: {paths.local_model}")
+        else:
+            pending = paths.local_model.parent / f".{paths.local_model.name}.download-partial"
+            if pending.is_symlink():
+                raise SystemExit("ERROR: download staging directory must not be a symlink")
+            marker = pending / PROVENANCE_DIR / "request.json"
+            if pending.exists():
+                if read_json(marker) != request:
+                    raise SystemExit(f"ERROR: staging selection differs; preserve or move aside {pending}")
+            else:
+                pending.mkdir()
+                write_json(marker, request)
+            staged = replace(paths, local_model=pending)
+            if not (pending / SNAPSHOT).exists():
+                download_model(args, staged, info)
+                assessment = assess_source(pending, info, names, request["base_snapshots"])
+                for warning in assessment["warnings"]:
+                    print(f"NOTICE: {warning}")
+                if args.require_source_complete and assessment["warnings"]:
+                    raise SystemExit("ERROR: source readiness checks failed; download remains staged")
+                seal_snapshot(pending, args, request=request, source_assessment=assessment)
+            manifest = verify_snapshot(pending)
+            if args.require_source_complete and manifest["source_assessment"]["warnings"]:
+                raise SystemExit("ERROR: staged snapshot has source readiness warnings")
+            if paths.local_model.exists():
+                raise SystemExit("ERROR: destination appeared during download")
+            pending.rename(paths.local_model)
+    ensure_checksums(paths.local_model, paths.local_checksum)
+
+
 def download_model(args: argparse.Namespace, paths: ArchivePaths,
                    info: dict | None = None) -> dict[str, str]:
     require_command("hf")
@@ -366,8 +586,8 @@ def download_model(args: argparse.Namespace, paths: ArchivePaths,
     names = selected_repo_files(info, args)
     if not names:
         raise SystemExit("ERROR: no repository files match the download filters")
-    if any(name.split("/", 1)[0] == PROVENANCE_DIR for name in names):
-        raise SystemExit(f"ERROR: repository uses reserved directory {PROVENANCE_DIR}")
+    if any(name.split("/", 1)[0] in {PROVENANCE_DIR, ".cache"} for name in names):
+        raise SystemExit("ERROR: repository uses reserved archive-provenance or .cache directory")
     endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
     parsed = urlsplit(endpoint)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
@@ -398,6 +618,20 @@ def download_model(args: argparse.Namespace, paths: ArchivePaths,
 
     started_at = datetime.now(timezone.utc).isoformat()
     run_command(command)
+    if not getattr(args, "skip_upstream_verification", False):
+        verification = ["hf", "cache", "verify", args.hf_repo, "--revision", commit,
+                        "--local-dir", str(paths.local_model)]
+        if len(names) == len(info["siblings"]):
+            verification.append("--fail-on-missing-files")
+        run_command(verification)
+    # CLI cache metadata is mutable and is not part of the portable snapshot.
+    cache = paths.local_model / ".cache"
+    if cache.is_symlink():
+        raise SystemExit("ERROR: unexpected symlink in download cache")
+    if cache.is_dir():
+        shutil.rmtree(cache)
+    if set(local_file_names(paths.local_model)) != set(names):
+        raise SystemExit("ERROR: downloaded file set differs from the selected repository files")
     completed_at = datetime.now(timezone.utc).isoformat()
     return write_provenance(args, paths, info, names, endpoint, started_at, completed_at)
 
@@ -465,7 +699,7 @@ def write_provenance(args: argparse.Namespace, paths: ArchivePaths, info: dict,
         "requested_revision": args.revision or "main", "repository_commit": info["sha"],
         "revision_url": f"{source_url}/tree/{info['sha']}",
         "download_started_at": started_at, "download_completed_at": completed_at,
-        "timestamp_note": "UTC times for this successful hf download invocation; files may be reused from cache",
+        "timestamp_note": "UTC interval for download and optional upstream verification; files may be reused from cache",
         "model_kinds": kinds or ["unknown"],
         "declared_base_model": card.get("base_model"),
         "declared_base_model_relation": card.get("base_model_relation"),
@@ -495,32 +729,57 @@ def write_provenance(args: argparse.Namespace, paths: ArchivePaths, info: dict,
 
 
 def sync_to_nas(args: argparse.Namespace, paths: ArchivePaths) -> None:
+    if not resolve_path(args.nas_root).is_dir():
+        raise SystemExit("ERROR: NAS root must already exist; mount or create the intended storage first")
+    copy_snapshot(paths.local_model, paths.nas_model, paths.checksum)
+
+
+def copy_snapshot(source: Path, destination: Path, checksum: Path) -> None:
     require_command("rsync")
-    if not paths.local_model.is_dir():
-        raise SystemExit(f"ERROR: local model directory does not exist: {paths.local_model}")
-
-    paths.nas_model.parent.mkdir(parents=True, exist_ok=True)
-
-    print_section("Syncing model to NAS")
-    print(f"Source      : {paths.local_model}")
-    print(f"Destination : {paths.nas_model}")
-    print()
-
-    command = [
-        "rsync",
-        "-avh",
-        "--info=progress2",
-        "--partial",
-    ]
-    if args.rsync_delete:
-        command.append("--delete")
-    command.extend([f"{paths.local_model}/", f"{paths.nas_model}/"])
-
-    run_command(command)
+    if source == destination or source.is_relative_to(destination) or destination.is_relative_to(source):
+        raise SystemExit("ERROR: copy source and destination must be separate, non-overlapping directories")
+    verify_snapshot(source)
+    expected = inventory(source)
+    with publication_lock(destination):
+        if destination.exists():
+            verify_snapshot(destination, expected)
+        else:
+            pending = destination.parent / f".{destination.name}.copy-partial"
+            marker = destination.parent / f".{destination.name}.copy-request.json"
+            if pending.is_symlink():
+                raise SystemExit("ERROR: copy staging directory must not be a symlink")
+            if pending.exists():
+                if read_json(marker) != expected:
+                    raise SystemExit(f"ERROR: different snapshot already staged at {pending}")
+            else:
+                # A marker may remain after an interrupted publication.
+                if marker.exists() and read_json(marker) != expected:
+                    raise SystemExit(f"ERROR: conflicting copy marker: {marker}")
+                if not marker.exists():
+                    write_json(marker, expected)
+                pending.mkdir()
+            print(f"Copying and verifying: {source} -> {destination}")
+            # --checksum also repairs same-size/mtime corruption on a resumed copy.
+            run_command(["rsync", "-avh", "--checksum", "--partial", f"{source}/", f"{pending}/"])
+            verify_snapshot(pending, expected)
+            verify_snapshot(source, expected)
+            if destination.exists():
+                raise SystemExit("ERROR: destination appeared during copy")
+            pending.rename(destination)
+            marker.unlink()
+    ensure_checksums(destination, checksum)
 
 
 def iter_files(root: Path) -> Iterable[Path]:
-    return sorted(path for path in root.rglob("*") if path.is_file())
+    if not root.is_dir() or root.is_symlink():
+        raise SystemExit(f"ERROR: expected a regular snapshot directory: {root}")
+    files = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink() or not (path.is_file() or path.is_dir()):
+            raise SystemExit(f"ERROR: snapshots must contain regular files/directories only: {path}")
+        if path.is_file():
+            files.append(path)
+    return files
 
 
 def sha256_file(path: Path) -> str:
@@ -531,55 +790,45 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def checksum_name(root: Path, path: Path) -> str:
-    relative = path.relative_to(root).as_posix()
-    return f"./{relative}"
-
-
 def write_checksums(paths: ArchivePaths) -> None:
-    write_directory_checksums(paths.nas_model, paths.checksum)
+    verify_snapshot(paths.nas_model)
+    ensure_checksums(paths.nas_model, paths.checksum)
 
 
-def write_directory_checksums(root: Path, destination: Path,
-                              known_hashes: dict[str, str] | None = None) -> None:
-    if not root.is_dir():
-        raise SystemExit(f"ERROR: model directory does not exist: {root}")
-    if destination.is_relative_to(root):
-        raise SystemExit("ERROR: checksum manifest must be outside the model directory")
+def checksum_text(hashes: dict[str, str]) -> str:
+    lines = []
+    for relative, digest in sorted(hashes.items()):
+        name = "./" + relative
+        escaped = "\\" in name or "\n" in name
+        name = name.replace("\\", "\\\\").replace("\n", "\\n")
+        lines.append(("\\" if escaped else "") + f"{digest}  {name}\n")
+    return "".join(lines)
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
 
-    print_section("Generating SHA-256 checksums")
-    print(f"Model    : {root}")
-    print(f"Checksum : {destination}")
-    print()
-
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=destination.parent,
-                                     prefix=".checksum-", delete=False) as checksum_file:
-        pending = Path(checksum_file.name)
-        try:
-            for path in iter_files(root):
-                relative = path.relative_to(root).as_posix()
-                digest = (known_hashes or {}).get(relative) or sha256_file(path)
-                name = checksum_name(root, path)
-                # GNU checksum format escapes filenames containing newlines/backslashes.
-                escaped = "\\" in name or "\n" in name
-                name = name.replace("\\", "\\\\").replace("\n", "\\n")
-                checksum_file.write(("\\" if escaped else "") + f"{digest}  {name}\n")
-        except BaseException:
-            pending.unlink(missing_ok=True)
-            raise
-    try:
-        pending.replace(destination)
-    finally:
-        pending.unlink(missing_ok=True)
+def ensure_checksums(root: Path, destination: Path, require_existing: bool = False) -> None:
+    content = checksum_text(inventory(root))
+    if destination.exists():
+        if destination.read_text(encoding="utf-8") != content:
+            raise SystemExit(f"ERROR: saved checksum verification failed: {destination}")
+    elif require_existing:
+        raise SystemExit(f"ERROR: saved checksum file is missing: {destination}")
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("x", encoding="utf-8") as output:
+            output.write(content)
 
 
 def create_local_archive(paths: ArchivePaths) -> None:
-    require_command("tar")
-    if not paths.local_model.is_dir():
-        raise SystemExit(f"ERROR: local model directory does not exist: {paths.local_model}")
-
+    verify_snapshot(paths.local_model)
+    expected = inventory(paths.local_model)
+    if paths.local_archive.is_relative_to(paths.local_model):
+        raise SystemExit("ERROR: archive must be outside the model directory")
+    if not str(paths.local_archive).endswith((".tar", ".tar.zst")):
+        raise SystemExit("ERROR: archive path must end in .tar or .tar.zst")
+    if paths.local_archive.exists():
+        inspect_archive(paths.local_archive, expected)
+        print(f"Verified existing archive: {paths.local_archive}")
+        return
     paths.local_archive.parent.mkdir(parents=True, exist_ok=True)
 
     print_section("Creating local tar archive")
@@ -596,17 +845,27 @@ def create_local_archive(paths: ArchivePaths) -> None:
         temp_archive = Path(temp_file.name)
 
     try:
-        command = [
-            "tar",
-            "--zstd",
-            "-cvf",
-            str(temp_archive),
-            "-C",
-            str(paths.local_model.parent),
-            paths.local_model.name,
-        ]
-        run_command(command)
-        temp_archive.replace(paths.local_archive)
+        with temp_archive.open("wb") as output:
+            compressor = None
+            if str(paths.local_archive).endswith(".zst"):
+                require_command("zstd")
+                compressor = subprocess.Popen(["zstd", "-q", "-c"], stdin=subprocess.PIPE, stdout=output)
+            try:
+                with tarfile.open(fileobj=compressor.stdin if compressor else output,
+                                  mode="w|", dereference=True) as tar:
+                    tar.add(paths.local_model, arcname=paths.local_model.name)
+                if compressor:
+                    compressor.stdin.close()
+                    if compressor.wait() != 0:
+                        raise SystemExit("ERROR: zstd compression failed")
+            finally:
+                if compressor and compressor.poll() is None:
+                    compressor.terminate()
+                    compressor.wait()
+        inspect_archive(temp_archive, expected, compressed=str(paths.local_archive).endswith(".zst"))
+        verify_snapshot(paths.local_model, expected)
+        # Hard-link publication cannot overwrite an existing archive, even in a race.
+        os.link(temp_archive, paths.local_archive)
     finally:
         temp_archive.unlink(missing_ok=True)
 
@@ -622,22 +881,195 @@ def write_archive_checksum(paths: ArchivePaths) -> None:
     print(f"Checksum : {paths.local_archive_checksum}")
     print()
 
-    checksum = sha256_file(paths.local_archive)
-    with paths.local_archive_checksum.open("w", encoding="utf-8") as checksum_file:
-        checksum_file.write(f"{checksum}  {paths.local_archive.name}\n")
+    inspect_archive(paths.local_archive)
+    content = checksum_text({paths.local_archive.name: sha256_file(paths.local_archive)})
+    if paths.local_archive_checksum.exists():
+        if paths.local_archive_checksum.read_text(encoding="utf-8") != content:
+            raise SystemExit("ERROR: archive checksum mismatch; refusing to replace baseline")
+    else:
+        with paths.local_archive_checksum.open("x", encoding="utf-8") as checksum_file:
+            checksum_file.write(content)
+
+
+def inspect_archive(path: Path, expected: dict[str, str] | None = None,
+                    compressed: bool | None = None) -> dict:
+    """Read every archived byte and validate the snapshot without extracting paths."""
+    compressed = str(path).endswith(".zst") if compressed is None else compressed
+    decompressor = None
+    actual = {}
+    manifest = None
+    top = None
+    with path.open("rb") as source:
+        if compressed:
+            require_command("zstd")
+            decompressor = subprocess.Popen(["zstd", "-q", "-d", "-c"], stdin=source, stdout=subprocess.PIPE)
+        stream = decompressor.stdout if decompressor else source
+        try:
+            with tarfile.open(fileobj=stream, mode="r|") as tar:
+                for member in tar:
+                    parts = member.name.split("/")
+                    if any(p in {"", ".", ".."} for p in parts) or "\\" in member.name:
+                        raise SystemExit("ERROR: unsafe archive path")
+                    top = top or parts[0]
+                    if parts[0] != top:
+                        raise SystemExit("ERROR: archive contains multiple snapshot roots")
+                    if member.isdir():
+                        continue
+                    if not member.isfile() or len(parts) < 2:
+                        raise SystemExit("ERROR: archive contains a link or special file")
+                    name = "/".join(parts[1:])
+                    if name in actual:
+                        raise SystemExit("ERROR: duplicate archive member")
+                    digest = hashlib.sha256()
+                    file = tar.extractfile(member)
+                    if name == SNAPSHOT:
+                        if member.size > 64 * 1024 * 1024:
+                            raise SystemExit("ERROR: snapshot manifest exceeds 64 MiB")
+                        data = file.read()
+                        manifest = json.loads(data)
+                        digest.update(data)
+                    else:
+                        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    actual[name] = digest.hexdigest()
+            # Drain trailing tar padding so zstd can finish and validate its stream.
+            while stream.read(1024 * 1024):
+                pass
+            if decompressor and decompressor.wait() != 0:
+                raise SystemExit("ERROR: zstd archive verification failed")
+        finally:
+            if decompressor:
+                stream.close()
+                if decompressor.poll() is None:
+                    decompressor.terminate()
+                    decompressor.wait()
+    contents = {n: h for n, h in actual.items() if n != SNAPSHOT}
+    if (not isinstance(manifest, dict) or manifest.get("schema_version") != 1
+            or not contents or contents != manifest.get("files")
+            or (expected is not None and actual != expected)):
+        raise SystemExit("ERROR: archive contents do not match the snapshot hashes")
+    print(f"Verified archive contents: {path}")
+    return manifest
+
+
+def verify_archive(paths: ArchivePaths) -> None:
+    content = checksum_text({paths.local_archive.name: sha256_file(paths.local_archive)})
+    if paths.local_archive_checksum.read_text(encoding="utf-8") != content:
+        raise SystemExit("ERROR: archive checksum verification failed")
+    inspect_archive(paths.local_archive)
+
+
+def prepare_conversion(args: argparse.Namespace) -> tuple[dict, dict[str, Path], Path]:
+    recipe_path = resolve_path(args.record_conversion)
+    recipe = read_json(recipe_path)
+    required = {"name", "source_directory", "converter", "commands", "environment", "dependency_files", "calibration_files"}
+    if set(recipe) != required:
+        raise SystemExit(f"ERROR: conversion recipe must contain exactly: {', '.join(sorted(required))}")
+    name = recipe["name"]
+    converter = recipe["converter"]
+    if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name)
+            or name == "download"
+            or not isinstance(converter, dict) or not converter.get("repository")
+            or not isinstance(converter.get("commit"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}", converter["commit"])):
+        raise SystemExit("ERROR: recipe needs a simple name and converter repository/full commit SHA")
+    commands = recipe["commands"]
+    if (not isinstance(commands, list) or not commands
+            or any(not isinstance(c, list) or not c or any(not isinstance(v, str) for v in c) for c in commands)
+            or not isinstance(recipe["environment"], dict) or not recipe["environment"]):
+        raise SystemExit("ERROR: recipe needs command argument arrays and a nonempty environment description")
+    def input_path(value):
+        if not isinstance(value, str) or not value:
+            raise SystemExit("ERROR: recipe paths must be nonempty strings")
+        return resolve_path(recipe_path.parent / Path(value).expanduser())
+    source = input_path(recipe.pop("source_directory"))
+    manifest = verify_snapshot(source)
+    if manifest.get("conversion_name") or manifest["repository"] != args.hf_repo:
+        raise SystemExit("ERROR: recipe source must be a source snapshot of the requested repository")
+    if not any(file_format(n)["model_kind"] == "source_format_weights" for n in manifest["files"]):
+        raise SystemExit("ERROR: recipe source has no source-format weights")
+    if args.revision and args.revision != manifest["repository_commit"]:
+        raise SystemExit("ERROR: --revision conflicts with recipe source")
+    if args.conversion_name and args.conversion_name != name:
+        raise SystemExit("ERROR: --conversion-name conflicts with recipe")
+    args.snapshot_commit = manifest["repository_commit"]
+    args.conversion_name = name
+    recipe["source"] = {"repository": manifest["repository"], "repository_commit": args.snapshot_commit,
+                        "snapshot_sha256": sha256_file(source / SNAPSHOT)}
+    inputs = {f"{PROVENANCE_DIR}/source-snapshot.json": source / SNAPSHOT}
+    for category in ("dependency_files", "calibration_files"):
+        values = recipe[category]
+        if not isinstance(values, list) or (category == "dependency_files" and not values):
+            raise SystemExit("ERROR: dependency_files must be nonempty; calibration_files must be a list (possibly empty)")
+        records = []
+        for i, value in enumerate(values):
+            file = input_path(value)
+            if not file.is_file():
+                raise SystemExit(f"ERROR: missing conversion input: {file}")
+            target = f"{PROVENANCE_DIR}/conversion-inputs/{category}/{i}-{file.name}"
+            inputs[target] = file
+            records.append({"path": target, "sha256": sha256_file(file)})
+        recipe[category] = records
+    recipe["record_note"] = "User-reported conversion commands/environment; recorded, not executed or independently attested"
+    outputs = resolve_path(args.local_model_dir)
+    names = list(inventory(outputs))
+    if any(n.split("/")[0] in {PROVENANCE_DIR, ".cache"} for n in names):
+        raise SystemExit("ERROR: conversion output directory must not contain cache or archive provenance")
+    if not any(n.endswith(".gguf") for n in names) or infer_layout(names) != "gguf":
+        raise SystemExit("ERROR: conversion outputs must contain GGUF and no source-format weights")
+    args.local_model_dir = None
+    return recipe, inputs, outputs
+
+
+def record_conversion(args: argparse.Namespace, paths: ArchivePaths,
+                      recipe: dict, inputs: dict[str, Path], outputs: Path) -> None:
+    expected = inventory(outputs)
+    if outputs == paths.local_model or outputs.is_relative_to(paths.local_model) or paths.local_model.is_relative_to(outputs):
+        raise SystemExit("ERROR: conversion outputs and archive destination must not overlap")
+    request = {"recipe": recipe, "outputs": expected}
+    with publication_lock(paths.local_model):
+        if paths.local_model.exists():
+            existing = verify_snapshot(paths.local_model)
+            if existing.get("request") != request:
+                raise SystemExit("ERROR: conversion name already exists with different contents or recipe")
+        else:
+            with tempfile.TemporaryDirectory(prefix=f".{args.conversion_name}.conversion-", dir=paths.local_model.parent) as work:
+                pending = Path(work) / "snapshot"
+                shutil.copytree(outputs, pending)
+                if inventory(pending) != expected:
+                    raise SystemExit("ERROR: GGUF outputs changed during import")
+                for name, source in inputs.items():
+                    destination = pending / name
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination)
+                for category in ("dependency_files", "calibration_files"):
+                    for file in recipe[category]:
+                        if sha256_file(pending / file["path"]) != file["sha256"]:
+                            raise SystemExit("ERROR: conversion input changed during import")
+                if sha256_file(pending / PROVENANCE_DIR / "source-snapshot.json") != recipe["source"]["snapshot_sha256"]:
+                    raise SystemExit("ERROR: source manifest changed during import")
+                write_json(pending / PROVENANCE_DIR / "conversion.json", recipe)
+                seal_snapshot(pending, args, request=request)
+                verify_snapshot(pending)
+                if paths.local_model.exists():
+                    raise SystemExit("ERROR: conversion destination appeared during import")
+                pending.rename(paths.local_model)
+    ensure_checksums(paths.local_model, paths.local_checksum)
 
 
 def summarize(paths: ArchivePaths, stages: set[str]) -> None:
     print_section("Complete")
     stage_list = ", ".join(
         stage
-        for stage in ("download", "sync", "checksum", "archive", "archive_checksum")
+        for stage in ("download", "conversion", "sync", "checksum", "backup", "archive", "archive_checksum", "verify", "verify_archive")
         if stage in stages
     )
     print(f"Stages   : {stage_list}")
     if "download" in stages or "sync" in stages or "archive" in stages:
         print(f"Local    : {paths.local_model}")
-    if "download" in stages:
+    if "conversion" in stages:
+        print(f"Conversion : {paths.local_model}")
+    if "download" in stages or "conversion" in stages:
         print(f"Local checksum : {paths.local_checksum}")
     if "sync" in stages or "checksum" in stages:
         print(f"Model    : {paths.nas_model}")
@@ -656,26 +1088,80 @@ def summarize(paths: ArchivePaths, stages: set[str]) -> None:
 def main() -> int:
     args = parse_args()
     stages = selected_stages(args)
+    if "sync" in stages and not resolve_path(args.nas_root).is_dir():
+        raise SystemExit("ERROR: NAS root must already exist; mount or create the intended storage first")
     model_name = args.model_name or default_model_name(args.hf_repo)
     info = None
+    conversion = None
     if "download" in stages:
         require_command("hf")
         info = model_info(args)
-    layout = choose_layout(args, stages, model_name, info)
+        args.snapshot_commit = info["sha"].lower()
+        if args.conversion_name:
+            raise SystemExit("ERROR: --conversion-name is only for locally converted artifacts")
+    elif "conversion" in stages:
+        conversion = prepare_conversion(args)
+    elif args.local_model_dir:
+        manifest = verify_snapshot(resolve_path(args.local_model_dir))
+        if manifest["repository"] != args.hf_repo or (args.revision and args.revision != manifest["repository_commit"]):
+            raise SystemExit("ERROR: repository/revision does not match local snapshot")
+        args.snapshot_commit = manifest["repository_commit"]
+        if args.conversion_name and args.conversion_name != manifest.get("conversion_name"):
+            raise SystemExit("ERROR: conversion name does not match local snapshot")
+        args.conversion_name = manifest.get("conversion_name")
+        if args.layout == "auto":
+            args.layout = manifest["layout"]
+        elif args.layout != manifest["layout"]:
+            raise SystemExit("ERROR: layout does not match local snapshot")
+    elif stages <= {"archive_checksum", "verify_archive"} and args.archive_path:
+        args.snapshot_commit = "0" * 40  # Only the explicitly supplied archive path is used.
+    layout = "gguf" if args.conversion_name else choose_layout(args, stages, model_name, info)
+    if args.conversion_name and args.layout == "source":
+        raise SystemExit("ERROR: local conversions use --layout gguf")
+    args.snapshot_layout = layout
     paths = build_paths(args, model_name, layout)
     print(f"Layout   : {MODEL_LAYOUTS[layout]}")
 
+    backup_paths = None
+    if args.backup_root:
+        backup_root = resolve_path(args.backup_root)
+        for other in (resolve_path(args.nas_root), resolve_path(args.local_root)):
+            if backup_root == other or backup_root.is_relative_to(other) or other.is_relative_to(backup_root):
+                raise SystemExit("ERROR: backup root must be separate from local and NAS roots")
+        if not backup_root.is_dir():
+            raise SystemExit("ERROR: backup root must already exist; mount or create the intended storage first")
+        backup_args = argparse.Namespace(**vars(args))
+        backup_args.nas_root = backup_root
+        backup_paths = build_paths(backup_args, model_name, layout)
+
     if "download" in stages:
-        hashes = download_model(args, paths, info)
-        write_directory_checksums(paths.local_model, paths.local_checksum, hashes)
+        publish_download(args, paths, info)
+    if conversion:
+        record_conversion(args, paths, *conversion)
     if "sync" in stages:
         sync_to_nas(args, paths)
     if "checksum" in stages:
         write_checksums(paths)
+    if backup_paths and stages & {"download", "conversion", "sync", "checksum", "archive"}:
+        source = paths.local_model if paths.local_model.exists() else paths.nas_model
+        copy_snapshot(source, backup_paths.nas_model, backup_paths.checksum)
+        stages.add("backup")
+        print(f"Verified backup: {backup_paths.nas_model}")
     if "archive" in stages:
         create_local_archive(paths)
     if "archive_checksum" in stages:
         write_archive_checksum(paths)
+    if "verify_archive" in stages:
+        verify_archive(paths)
+    if "verify" in stages:
+        root, checksum = {
+            "local": (paths.local_model, paths.local_checksum),
+            "nas": (paths.nas_model, paths.checksum),
+            "backup": (backup_paths.nas_model, backup_paths.checksum) if backup_paths else (None, None),
+        }[args.verify_target]
+        verify_snapshot(root)
+        ensure_checksums(root, checksum, require_existing=True)
+        print(f"Verified snapshot and saved checksums: {root}")
 
     summarize(paths, stages)
     return 0
@@ -687,3 +1173,6 @@ if __name__ == "__main__":
     except subprocess.CalledProcessError as error:
         print(f"ERROR: command failed with exit code {error.returncode}: {error.cmd}", file=sys.stderr)
         raise SystemExit(error.returncode)
+    except (OSError, ValueError, tarfile.TarError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        raise SystemExit(1)
