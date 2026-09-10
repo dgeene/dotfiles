@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     stage_group.add_argument(
         "--archive",
         action="store_true",
-        help="Create and verify an optional local tar archive (--compression none or zstd).",
+        help="Create and verify an optional local tar archive (uncompressed by default).",
     )
     stage_group.add_argument(
         "--archive-checksum",
@@ -197,7 +197,7 @@ def parse_args() -> argparse.Namespace:
     stage_group.add_argument("--verify-archive", action="store_true", help="Verify archive checksum and all embedded snapshot file hashes without extracting.")
     path_group.add_argument("--backup-root", type=Path, help="Also publish a verified independent directory copy beneath this existing root.")
     path_group.add_argument("--conversion-name", help="Select a locally converted artifact for offline stages.")
-    path_group.add_argument("--compression", choices=("none", "zstd"), default="zstd", help="Optional tar packaging compression.")
+    path_group.add_argument("--compression", choices=("none", "zstd"), default="none", help="Tar packaging compression (default: none); explicit --archive-path suffix determines its format.")
     download_group.add_argument("--skip-upstream-verification", action="store_true", help="Skip hf cache verify; local and transfer checks remain mandatory.")
     download_group.add_argument("--require-source-complete", action="store_true", help="Fail on source readiness warnings; does not certify converter support.")
     download_group.add_argument("--base-model-dir", action="append", type=Path, default=[], help="Verified base-model snapshot dependency; repeat for multiple bases.")

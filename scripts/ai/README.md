@@ -241,20 +241,77 @@ commands produced the outputs. Use a new conversion name if any output, recipe,
 or input changes. Downloaded third-party GGUF provenance records its publisher's
 revision; it does not invent a conversion recipe.
 
+## Hardware requirements for inference
+
+An archived model needs both a compatible runtime/GPU and enough memory to run.
+The archive tool preserves metadata but does not calculate hardware requirements
+or test runtime compatibility.
+
+1. Inspect the snapshot's `README.md` for the publisher's usage instructions and
+   dependencies. Check `config.json` for architecture, `dtype` / `torch_dtype`,
+   and `quantization_config`. The `source_assessment` in
+   `archive-provenance/snapshot.json` summarizes declared values and warnings;
+   these declarations are not verified tensor precision. Identify the exact GGUF
+   variant or complete set of weight shards you intend to load, including any
+   required base model or multimodal components.
+2. Estimate weight memory as `total parameters × bits per parameter ÷ 8` bytes.
+   For an 8-billion-parameter model, theoretical weights alone require:
+
+   | Precision | Approximate weight memory (decimal GB) |
+   |---|---:|
+   | FP32 | 32 GB |
+   | FP16 / BF16 | 16 GB |
+   | 8-bit | 8 GB |
+   | 4-bit | 4 GB |
+
+   These are not total VRAM requirements. Quantization metadata, runtime working
+   memory, and the KV cache add overhead. Longer context and more simultaneous
+   requests can substantially increase memory use. Use actual selected weight
+   sizes to refine the estimate, allowing for the runtime's loaded precision;
+   compressed tar size does not estimate runtime memory. For mixture-of-experts
+   models, use total parameters for weight storage, not just active parameters.
+   See the [Hugging Face cache documentation](https://huggingface.co/docs/transformers/main/en/kv_cache).
+3. Check that your runtime version supports the exact model architecture,
+   quantization, GPU, drivers, and operating system. For example,
+   [llama.cpp](https://github.com/ggml-org/llama.cpp) runs supported GGUF models
+   using backends such as NVIDIA CUDA and Apple Metal, and supports CPU execution
+   and mixed CPU/GPU loading. Offloading requires sufficient system RAM and can
+   reduce speed. On Apple silicon, budget available unified memory shared with
+   the OS and other applications. Enough memory alone does not prove compatibility.
+4. Test the exact artifact at your intended context length and concurrency.
+   Record peak memory and generation speed; loading successfully does not prove
+   the model is fast enough for your use. These estimates concern inference;
+   training and fine-tuning have different memory requirements.
+
+Keep a test record outside the sealed snapshot, such as under
+`$XDG_STATE_HOME/hf-model-archives` (default `~/.local/state/hf-model-archives`).
+Record the model revision and artifact, quantization, runtime/version, OS/driver,
+GPU and VRAM (or Mac/unified memory), system RAM, context length, concurrency,
+offloading settings, peak memory, and measured speed. Do not edit the published
+snapshot to add hardware notes.
+
 ## Optional packaging and restore checks
 
-Ordinary directories remain the default storage format. Use tar for transport or
-cold storage; measure compression savings before keeping duplicate packaged copies.
+Ordinary uncompressed directories remain the default storage format; the standard
+workflow does not create a tar archive. `--archive` optionally packages a snapshot
+as an uncompressed `.tar`. Compression is not required for preservation, checksums,
+or verification. Enable zstd only when its storage/transfer savings justify the
+extra compression/decompression work; measure savings on your actual artifacts.
 
 ```sh
+# Optional uncompressed tar (no zstd dependency)
 ./archive-hf-model Qwen/Qwen3-8B --revision FULL_COMMIT --archive
-./archive-hf-model Qwen/Qwen3-8B --revision FULL_COMMIT --archive --compression none
+
+# Opt in to zstd compression
+./archive-hf-model Qwen/Qwen3-8B --revision FULL_COMMIT --archive --compression zstd
 ```
 
 Archives default beside the local snapshot, named
-`<model>-<commit>[-<artifact>].tar.zst` or `.tar`. `--archive-dir` / `--archive-path`
+`<model>-<commit>[-<artifact>].tar`, or `.tar.zst` with `--compression zstd`.
+`--archive-dir` / `--archive-path`
 choose another location outside the snapshot; explicit filenames must end in
-`.tar` or `.tar.zst`, which determines their compression. Existing archives are
+`.tar` or `.tar.zst`, which determines their compression even when `--compression`
+is supplied. An explicit `.tar.zst` path also opts into compression. Existing archives are
 verified and reused, never overwritten. Archive publication requires filesystem
 hard-link support for the temporary and final archive in the same directory.
 
@@ -269,15 +326,23 @@ all embedded file hashes, without extracting:
 
 ```sh
 ./archive-hf-model Qwen/Qwen3-8B --verify-archive \
-  --archive-path /mounted/second-storage/Qwen3-8B-FULL_COMMIT.tar.zst
+  --archive-path /mounted/second-storage/Qwen3-8B-FULL_COMMIT.tar
 ```
 
 For a restore drill, extract the verified archive into a fresh empty directory:
 
 ```sh
 mkdir /storage/restore-check
+tar -xf /mounted/second-storage/Qwen3-8B-FULL_COMMIT.tar -C /storage/restore-check
+```
+
+For an optionally compressed archive, verify its `.tar.zst` path above, then
+extract into a fresh empty directory:
+
+```sh
+mkdir /storage/restore-check-zstd
 zstd -dc /mounted/second-storage/Qwen3-8B-FULL_COMMIT.tar.zst \
-  | tar -xf - -C /storage/restore-check
+  | tar -xf - -C /storage/restore-check-zstd
 ```
 
 Source archives contain a top-level commit directory; GGUF archives contain the

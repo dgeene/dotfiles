@@ -226,11 +226,13 @@ class ArchiveTests(unittest.TestCase):
 
     def test_archive_roundtrip_and_no_overwrite(self):
         self.download()
-        for compression in ['none'] + (['zstd'] if shutil.which('zstd') else []):
+        for compression in [None, 'none'] + (['zstd'] if shutil.which('zstd') else []):
             with self.subTest(compression=compression):
-                options = ('--revision', COMMIT, '--compression', compression)
+                compression_options = ('--compression', compression) if compression else ()
+                options = ('--revision', COMMIT, *compression_options)
                 self.run_cli('--archive', *options)
-                paths = self.paths('--compression', compression)
+                paths = self.paths(*compression_options)
+                self.assertTrue(str(paths.local_archive).endswith('.tar.zst' if compression == 'zstd' else '.tar'))
                 before = paths.local_archive.read_bytes()
                 self.run_cli('--archive', *options)
                 self.run_cli('--verify-archive', '--archive-path', str(paths.local_archive))
@@ -249,6 +251,7 @@ class ArchiveTests(unittest.TestCase):
                 paths.local_archive.write_bytes(b'corrupt')
                 with self.assertRaisesRegex(SystemExit, 'checksum'):
                     self.run_cli('--verify-archive', '--archive-path', str(paths.local_archive))
+                paths.local_archive.write_bytes(before)
 
     def test_archive_inside_snapshot_rejected(self):
         paths = self.download()
