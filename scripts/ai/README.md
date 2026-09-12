@@ -3,7 +3,24 @@
 `archive-hf-model` preserves commit-pinned Hugging Face snapshots for later use,
 plus separate GGUF inference artifacts. The default workflow downloads, checks
 against the Hub, seals the local snapshot, copies it to NAS staging, verifies the
-copy against the source hashes, then publishes the destination directory.
+copy against the source hashes, then publishes the destination directory and
+saves NAS checksums. Snapshots are ordinary uncompressed directories.
+
+Choose the stages you need:
+
+| Invocation | Result |
+|---|---|
+| No stage flags, or `--all` | Download, verify, copy to NAS, and save checksums. |
+| `--download` | Download and seal a local snapshot with local checksums. No NAS copy. |
+| `--sync` | Copy an existing local snapshot to NAS, verify it, and save NAS checksums. |
+| `--checksum` | Verify an existing NAS snapshot and create missing checksum files. |
+| `--verify` | Check an existing snapshot against its saved checksums; NAS is the default target. |
+| `--archive` | Package an existing local snapshot as an optional uncompressed `.tar`. Add `--compression zstd` for compression. |
+
+Explicit stage flags can be combined, for example `--download --sync`. `--all`
+runs only the standard download/sync/checksum workflow and cannot be combined
+with other stage flags. To archive to NAS later, use `--sync`; `--archive` selects
+local tar packaging, which is separate from the NAS directory copy.
 
 Original model weights can run on supported GPU runtimes directly. GGUF is a
 runtime format, and quantization is a separate precision/size tradeoff. Prefer
@@ -14,18 +31,25 @@ precision, lineage, or compatibility with a particular converter/runtime.
 ## Requirements
 
 - Python 3.9+; no additional Python packages required by this script.
-- For downloads: `hf` supporting `models info --expand --format json` and
-  `cache verify --local-dir --revision`. Authentication uses the CLI's existing
-  login or `HF_TOKEN`; do not put credentials in recipes or command arguments.
+- For downloads: `hf` supporting `models info --revision --expand --format json`,
+  `download --local-dir --revision`, and
+  `cache verify --local-dir --revision --fail-on-missing-files`. Authentication
+  uses the CLI's existing login or `HF_TOKEN`; do not put credentials in recipes
+  or command arguments.
 - For NAS/backup copies: `rsync` (including the older macOS version).
 - For `.tar.zst`: `zstd`. Uncompressed `.tar` needs only Python.
 
 The implementation supports Linux/macOS without requiring systemd, GNU tar,
-or a particular GPU. NAS and backup roots must already exist. Mount the intended
-storage before running; an existing directory alone does not prove a NAS is mounted.
+or a particular GPU. NAS paths refer to locally mounted storage, not `host:path`
+rsync destinations. The NAS root must already exist for `--sync` (including the
+default workflow); `--backup-root` must exist whenever supplied. `--download`
+alone needs neither NAS storage nor rsync. Mount the intended storage before
+copying; an existing directory alone does not prove a NAS is mounted.
 
 Run examples from `scripts/ai/`, or use the script's path from the checkout root.
 Run `./archive-hf-model --help` for all options.
+Replace `/mounted/...` and `/storage/...` examples with your actual storage paths,
+and `FULL_COMMIT` placeholders with the archived revision's full 40-character SHA.
 
 ## Storage and immutability
 
@@ -33,7 +57,7 @@ Local storage defaults to `$XDG_DATA_HOME/hf-model-archives`, falling back to
 `~/.local/share/hf-model-archives`. NAS defaults to `/mnt/ai-models`.
 Override with `--local-root` / `HF_MODEL_DOWNLOAD_ROOT` and `--nas-root` /
 `AI_MODELS_NAS_ROOT`. Choose a persistent disk with enough free space for the
-source, staged copies, and any optional archive; `/tmp` is no longer the default.
+source, staged copies, and any optional tar archive.
 
 ```text
 <root>/
@@ -65,16 +89,17 @@ Use a separate working/output directory. `--rsync-delete` is retired and rejecte
 published snapshot.
 
 A filtered selection occupies its own immutable snapshot. To archive another
-selection of the same repository commit, supply a different `model_name`:
-
-```sh
-./archive-hf-model owner/repo selected-q4 \
-  --include 'model-Q4_K_M.gguf' --include 'README.md' --include 'LICENSE*'
-```
+selection of the same repository commit, supply a different positional
+`model_name`, such as `Qwen3-8B-Q4_K_M` or `Qwen3-8B-Q8_0`. This changes the
+`<model>` directory component, not the repository identity. Use the same
+`model_name` for later sync, checksum, and verification stages, including when
+supplying `--local-model-dir`.
 
 Auto layout routes GGUF-only weights to `inference/gguf`; source weights, mixed
 repositories, and unknown selections use `source/huggingface`. `--layout` changes
 routing, not filtering. GGUF layout rejects recognized source-format weights.
+Offline stages locate existing organized snapshots automatically; specify
+`--layout source` or `--layout gguf` if both layouts exist for the same model/revision.
 
 Old flat or mutable owner/model directories are not moved, deleted, or silently
 adopted. Download the desired revision into a fresh snapshot to establish its
@@ -84,9 +109,18 @@ folders are rejected; a tar operation cannot reconstruct their original revision
 
 ## Download and source checks
 
+These examples archive complete publisher repositories from
+[Qwen](https://huggingface.co/Qwen/Qwen3-8B) and
+[Mistral](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3).
+Without `--include` / `--exclude`, every repository file is selected, including
+any alternative weight formats or duplicate representations the publisher supplies.
+
 ```sh
-# Default: download, verify, copy to NAS, and save checksums
-./archive-hf-model Qwen/Qwen3-8B
+# Source model: download, verify, copy to NAS, and save checksums
+./archive-hf-model Qwen/Qwen3-8B --nas-root /mounted/ai-models
+
+# Another publisher's source model, using the same workflow
+./archive-hf-model mistralai/Mistral-7B-Instruct-v0.3 --nas-root /mounted/ai-models
 
 # Local snapshot only, resolving a branch/tag or full commit
 ./archive-hf-model Qwen/Qwen3-8B --revision main --download
@@ -94,6 +128,33 @@ folders are rejected; a tar operation cannot reconstruct their original revision
 # Require the structural source checks to pass without warnings
 ./archive-hf-model Qwen/Qwen3-8B --download --require-source-complete
 ```
+
+For GGUF, select the desired quantization instead of downloading every variant.
+The examples below use filenames from the
+[Qwen GGUF repository](https://huggingface.co/Qwen/Qwen3-8B-GGUF/tree/main) and a
+[third-party Mistral GGUF repository](https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/tree/main):
+
+```sh
+# Publisher-provided Q4_K_M GGUF, downloaded and copied to NAS
+./archive-hf-model Qwen/Qwen3-8B-GGUF Qwen3-8B-Q4_K_M \
+  --include 'Qwen3-8B-Q4_K_M.gguf' --include 'README.md' \
+  --include 'LICENSE*' --include 'params' --nas-root /mounted/ai-models
+
+# Third-party Q5_K_M GGUF, with its model card and available conversion metadata
+./archive-hf-model bartowski/Mistral-7B-Instruct-v0.3-GGUF Mistral-7B-Instruct-v0.3-Q5_K_M \
+  --include 'Mistral-7B-Instruct-v0.3-Q5_K_M.gguf' --include 'README.md' \
+  --include 'LICENSE*' --include '*.imatrix' --nas-root /mounted/ai-models
+```
+
+Filters are case-sensitive and apply to paths relative to the repository root;
+quote patterns so your shell does not expand them. Inspect the repository file
+list before choosing a filename. For split GGUFs, include every shard of the
+selected variant, plus any required projector/encoder files for multimodal models.
+`--include 'LICENSE*'` preserves matching files only when present; review notices
+about missing terms. GGUF and filtered snapshots produce assessment notices in
+normal mode, so do not use `--require-source-complete` for these examples.
+Check that weights were selected: a mistyped weight pattern can still match only
+the separately included metadata files and publish a snapshot with warnings.
 
 Each download resolves a full commit before selecting or fetching files. It
 records repository URLs, selected files, UTC invocation times, sizes, local
@@ -122,8 +183,9 @@ These are structural checks, not a test load or an inspection of tensor precisio
 Full snapshots preserve custom code, chat templates, processors, and vision/audio
 components when the repository supplies them, but external dependencies and
 architecture-specific requirements still need review. No repository code is run.
-`--require-source-complete` makes all assessment warnings fatal; some valid
-non-Transformers repositories will need normal mode and manual review.
+`--require-source-complete` makes all assessment warnings fatal, including filtered
+selections, GGUF artifacts, and unresolved declared base models. Some valid
+repositories will therefore need normal mode and manual review.
 
 For adapters, archive the base model separately and attach its exact identity:
 
@@ -140,12 +202,67 @@ flagged as non-standalone, even when its base dependency is recorded.
 
 ## Verified NAS and independent copies
 
-Offline stages require `--revision` with the **full commit SHA**, or derive it
-from a sealed `--local-model-dir`. They never resolve `main` online.
+### Download now, copy to NAS later
+
+The download stage creates a sealed local snapshot and local checksums. It does
+not require the NAS to be mounted. This example chooses an explicit local root
+and reuses it when copying later:
 
 ```sh
-./archive-hf-model Qwen/Qwen3-8B --revision FULL_COMMIT --sync
+# Stage 1: download and verify locally
+./archive-hf-model Qwen/Qwen3-8B --download \
+  --local-root "$HOME/models/hf-archives"
 
+# Stage 2: after mounting the NAS, copy the already downloaded revision
+./archive-hf-model Qwen/Qwen3-8B --sync --revision FULL_COMMIT \
+  --local-root "$HOME/models/hf-archives" --nas-root /mounted/ai-models
+```
+
+Replace `FULL_COMMIT` with the commit directory in stage 1's final `Local` path,
+or read `repository_commit` in that snapshot's
+`archive-provenance/snapshot.json`. For this source model, the local path is
+`$HOME/models/hf-archives/source/huggingface/Qwen/Qwen3-8B/FULL_COMMIT`.
+`--sync` performs no Hub lookup or download: it verifies the snapshot, copies it,
+and writes NAS checksums. A separate `--checksum` flag is unnecessary. The local
+snapshot remains in place.
+
+Alternatively, provide the exact sealed directory printed by stage 1; the tool
+reads the revision and layout from its manifest:
+
+```sh
+./archive-hf-model Qwen/Qwen3-8B --sync \
+  --local-model-dir "$HOME/models/hf-archives/source/huggingface/Qwen/Qwen3-8B/FULL_COMMIT" \
+  --nas-root /mounted/ai-models
+```
+
+The same two stages work for a selected GGUF. Preserve the custom `model_name`
+when copying later; download filters do not need to be repeated for `--sync`:
+
+```sh
+# Stage 1: local GGUF snapshot only
+./archive-hf-model Qwen/Qwen3-8B-GGUF Qwen3-8B-Q4_K_M --download \
+  --include 'Qwen3-8B-Q4_K_M.gguf' --include 'README.md' \
+  --include 'LICENSE*' --include 'params' --local-root "$HOME/models/hf-archives"
+
+# Stage 2: use this GGUF repository's commit, not the source model's commit
+./archive-hf-model Qwen/Qwen3-8B-GGUF Qwen3-8B-Q4_K_M --sync \
+  --revision FULL_GGUF_COMMIT --local-root "$HOME/models/hf-archives" \
+  --nas-root /mounted/ai-models
+```
+
+The GGUF snapshot is under
+`inference/gguf/Qwen/Qwen3-8B-Q4_K_M/FULL_GGUF_COMMIT/download/` on both roots.
+Its commit appears immediately before `/download/` in the final `Local` path.
+For sync/checksum/verification stages, `--revision` must be the **full commit SHA**
+unless supplied via a sealed `--local-model-dir`; these stages never resolve
+`main` online. Continue using your selected roots on subsequent commands, or set
+`HF_MODEL_DOWNLOAD_ROOT` and `AI_MODELS_NAS_ROOT` as machine-local defaults.
+
+### Independent copies and verification
+
+The following examples use the configured/default local and NAS roots:
+
+```sh
 # Also preserve an independent directory copy
 ./archive-hf-model Qwen/Qwen3-8B --revision FULL_COMMIT \
   --sync --backup-root /mounted/second-storage
@@ -170,7 +287,10 @@ manifest. Existing destinations must match; corruption never becomes a new basel
 never replaces an existing checksum baseline.
 
 Interrupted downloads and copies remain in hidden `.*.download-partial` or
-`.*.copy-partial` directories. Rerun with the same selection to resume. Publication
+`.*.copy-partial` directories. Rerun with the same full revision, model name,
+roots, and download selection/options to resume; `main` may have moved since the
+interruption. For an unfinished download, the pinned commit is recorded in the
+staging directory's `archive-provenance/request.json` under `commit`. Publication
 locks prevent concurrent writers; after a killed process, remove an empty stale
 `.lock` directory only after confirming no writer is running. Conflicting staging
 requests must be reviewed and moved aside manually. Published data is never
@@ -220,8 +340,11 @@ paths, versions, commits, and commands:
 }
 ```
 
-Paths in the recipe are relative to the recipe file unless absolute. The converter
-commit must be a full lowercase SHA. `dependency_files` must be nonempty; use
+`source_directory`, `dependency_files`, and `calibration_files` paths are relative
+to the recipe file unless absolute. Entries in `commands` are recorded verbatim;
+include the original working directory in `environment` when it matters. The recipe
+must contain exactly the top-level keys shown. The converter commit must be a
+full lowercase SHA. `dependency_files` must be nonempty; use
 `calibration_files: []` when no calibration was used. Otherwise list the data and
 importance-matrix files to preserve. Only include non-secret files and commands.
 
@@ -232,6 +355,10 @@ importance-matrix files to preserve. Only include non-secret files and commands.
 ./archive-hf-model Qwen/Qwen3-8B --revision FULL_SOURCE_COMMIT \
   --conversion-name q4-k-m --verify
 ```
+
+`--record-conversion` alone imports locally; the example also adds `--sync` to copy
+the result to NAS. The input `--local-model-dir` is the converter's output directory;
+the imported snapshot is published under `--local-root` in the GGUF layout.
 
 Import verifies the source snapshot, copies the existing GGUF outputs, bundles
 and hashes dependency/calibration files and the source manifest, then seals a
