@@ -15,6 +15,9 @@ categories (requires the `huggingface_hub` Python package).
 See the [catalog guide](scripts/ai/README.md#markdown-download-catalog) for custom
 roots, mirrored indexes, and read-only previews.
 
+See the [fine-tuning guide](docs/guides/fine-tuning-source-models.md) for hardware,
+custom training data, a complete QLoRA walkthrough, evaluation, and GGUF quantization.
+
 Future implementation plans live in [docs/ideas](docs/ideas/README.md), with an
 index, a handoff template, and proposed features for later AI implementation.
 
