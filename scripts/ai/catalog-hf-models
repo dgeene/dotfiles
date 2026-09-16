@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""Build an offline Markdown catalog of downloaded model directories and packages."""
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import html
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
+from urllib.parse import quote
+
+MARKER = '<!-- model-catalog:v1 -->'
+LAYOUTS = {'source/huggingface': 'Source', 'inference/gguf': 'GGUF'}
+WEIGHTS = {'.safetensors', '.gguf', '.bin', '.pt', '.pth', '.ckpt', '.h5', '.msgpack'}
+SNAPSHOT = Path('archive-provenance/snapshot.json')
+MAX_METADATA = 16 * 1024 * 1024
+
+
+def metadata(path: Path, optional: bool = False) -> dict:
+    if optional and not path.exists():
+        return {}
+    if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode) or path.stat().st_size > MAX_METADATA:
+        raise ValueError(f'Expected regular metadata file of at most 16 MiB: {path}')
+    value = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(value, dict):
+        raise ValueError(f'Expected JSON object: {path}')
+    return value
+
+
+def plain(value) -> str:
+    """Make repository-supplied text inert in generated Markdown tables."""
+    if value is None or value == '':
+        return 'Unknown'
+    if isinstance(value, (list, dict)):
+        value = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    value = ' '.join(str(value).split())
+    value = html.escape(value, quote=False)
+    for char in '\\`*_{}[]|':
+        value = value.replace(char, f'&#{ord(char)};')
+    return value
+
+
+def card_text(root: Path) -> str:
+    card = next((root / name for name in ('README.md', 'readme.md', 'README.MD')
+                 if (root / name).is_file() and not (root / name).is_symlink()), None)
+    if card is None:
+        return ''
+    # Read only the beginning of a card, never model weights.
+    with card.open('r', encoding='utf-8', errors='replace') as stream:
+        return stream.read(64 * 1024)
+
+
+def card_fields(text: str) -> dict:
+    """Read common plain scalar/list card fields, without a YAML dependency.
+
+    Complex YAML (objects, anchors, folded blocks) is deliberately left unknown.
+    """
+    match = re.match(r'\A\ufeff?---[^\n]*\n(.*?)\n(?:---|\.\.\.)[^\n]*(?:\n|$)', text, re.S)
+    if not match:
+        return {}
+    allowed = {'base_model', 'license', 'pipeline_tag', 'language', 'library_name'}
+    result, current = {}, None
+    def scalar(value):
+        value = value.strip()
+        if not value or value[0] in '|>{[&*!' or ' #' in value:
+            return None
+        return value.strip('\"\'')
+    for line in match.group(1).splitlines():
+        field = re.match(r'^([\w-]+):\s*(.*)$', line)
+        if field:
+            current = field[1] if field[1] in allowed else None
+            if current:
+                result[current] = scalar(field[2]) if field[2] else []
+        elif current and isinstance(result.get(current), list):
+            item = re.match(r'^\s*-\s+(.+)$', line)
+            if item and scalar(item[1]):
+                result[current].append(scalar(item[1]))
+    return {key: value for key, value in result.items() if value}
+
+
+def card_summary(text: str, model_name: str) -> str:
+    text = re.sub(r'\A\ufeff?---[^\n]*\n.*?\n(?:---|\.\.\.)[^\n]*(?:\n|$)', '', text, count=1, flags=re.S)
+    text = re.sub(r'<!--.*?-->', '', text, flags=re.S)
+    text = re.sub(r'```.*?```|~~~.*?~~~', '', text, flags=re.S)
+    # Prefer the actual model section over a quantization publisher's preamble.
+    model_name = re.sub(r'[-.]gguf$', '', model_name, flags=re.I)
+    section = re.search(r'^#{1,6}\s+(?:Model description|' + re.escape(model_name) + r')\s*#*\s*$', text, re.M | re.I)
+    if section:
+        text = text[section.end():]
+    candidates = []
+    for paragraph in re.split(r'\n\s*\n', text):
+        paragraph = paragraph.strip()
+        if not paragraph or paragraph.startswith(('#', '|', '>', '- ', '* ', '<', '[!')):
+            continue
+        paragraph = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', paragraph)
+        paragraph = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', paragraph)
+        paragraph = re.sub(r'<[^>]*>', '', paragraph)
+        paragraph = re.sub(r'\*\*(.*?)\*\*|__(.*?)__', lambda m: m[1] or m[2], paragraph)
+        paragraph = ' '.join(paragraph.split()).strip('*_` ')
+        if len(paragraph) >= 40 and len(re.findall(r'[A-Za-z]', paragraph)) >= 25:
+            candidates.append(paragraph)
+            if len(candidates) == 8:
+                break
+    if not candidates:
+        return ''
+    # Prefer an early description of the model over a generic release announcement.
+    description = re.compile(r'\b(?:parameters?|language model|vision.language|multimodal|reasoning|coding|instruction|LLM|abliterat\w*)\b', re.I)
+    paragraph = next((p for p in candidates if description.search(p)), candidates[0])
+    return paragraph if len(paragraph) <= 400 else paragraph[:397].rsplit(' ', 1)[0] + '…'
+
+
+def walk(root: Path, include_hidden: bool = False):
+    def onerror(error):
+        raise error
+    for directory, dirs, files in os.walk(root, followlinks=False, onerror=onerror):
+        path = Path(directory)
+        dirs[:] = sorted(d for d in dirs if (include_hidden or not d.startswith('.')) and not (path / d).is_symlink())
+        yield path, dirs, sorted(files)
+
+
+def sizes(root: Path, exclude_revisions: bool = False) -> dict[str, int]:
+    result = {}
+    for directory, dirs, files in walk(root, include_hidden=True):
+        if directory == root and exclude_revisions:
+            dirs[:] = [d for d in dirs if not re.fullmatch(r'[0-9a-f]{40}', d)]
+        for name in files:
+            path = directory / name
+            if path.is_symlink():
+                continue
+            info = path.stat()
+            if stat.S_ISREG(info.st_mode):
+                result[path.relative_to(root).as_posix()] = info.st_size
+    return result
+
+
+def summarize_model(root: Path, base: Path, label: str, kind: str) -> dict:
+    if (root / 'archive-provenance').is_symlink():
+        raise ValueError(f'Symlinked provenance directory: {root}')
+    sealed = (root / SNAPSHOT).exists() or (root / SNAPSHOT).is_symlink()
+    manifest = metadata(root / SNAPSHOT) if sealed else {}
+    if sealed and (manifest.get('schema_version') != 1
+                   or not re.fullmatch(r'[0-9a-f]{40}', str(manifest.get('repository_commit', '')))
+                   or not isinstance(manifest.get('files'), dict)
+                   or not isinstance(manifest.get('repository'), str)):
+        raise ValueError(f'Invalid snapshot metadata: {root / SNAPSHOT}')
+    files = sizes(root, exclude_revisions=not sealed)
+    relative = root.relative_to(base)
+    owner_model = '/'.join(relative.parts[:2])
+    repository = manifest.get('repository') or owner_model
+    assessment = manifest.get('source_assessment') or {}
+    if not isinstance(assessment, dict):
+        raise ValueError(f'Invalid source assessment: {root}')
+    config = metadata(root / 'config.json', optional=True)
+    text_config = config.get('text_config') or {}
+    if not isinstance(text_config, dict):
+        text_config = {}
+    text = card_text(root)
+    card = card_fields(text)
+    conversion = metadata(root / 'archive-provenance/conversion.json', optional=True)
+    if manifest.get('conversion_name') and not assessment:
+        assessment = metadata(root / 'archive-provenance/source-snapshot.json', optional=True).get('source_assessment') or {}
+        if not isinstance(assessment, dict):
+            raise ValueError(f'Invalid conversion source assessment: {root}')
+    request = manifest.get('request') or {}
+    if not isinstance(request, dict):
+        raise ValueError(f'Invalid request metadata: {root}')
+    recipe = conversion or request.get('recipe', {})
+    dtype = (assessment.get('declared_dtype') or config.get('dtype') or config.get('torch_dtype')
+             or text_config.get('dtype') or text_config.get('torch_dtype'))
+    architecture = assessment.get('architectures') or config.get('architectures')
+    base_model = assessment.get('declared_base_model') or card.get('base_model')
+    if not base_model:
+        adapter = metadata(root / 'adapter_config.json', optional=True)
+        base_model = adapter.get('base_model_name_or_path')
+    weight_names = sorted(n for n in files if Path(n).suffix.lower() in WEIGHTS
+                          and not n.startswith('archive-provenance/'))
+    formats = sorted({Path(n).suffix.lower().lstrip('.') for n in weight_names})
+    quants = set()
+    for name in weight_names:
+        if name.lower().endswith('.gguf'):
+            match = re.search(r'(?:^|[.\-_])((?:IQ|PQ|Q|TQ)\d[0-9A-Z_]*|BF16|FP?16|FP?32|FP8)(?=[.\-]|$)', Path(name).name.upper())
+            if match:
+                quants.add(match.group(1))
+    quantization = config.get('quantization_config') or assessment.get('quantization_config')
+    warnings = assessment.get('warnings', [])
+    if not isinstance(warnings, list):
+        raise ValueError(f'Invalid readiness warnings: {root}')
+    warnings = list(warnings)
+    if sealed:
+        missing = sorted(set(manifest['files']) - files.keys())
+        extra = sorted(files.keys() - set(manifest['files']) - {SNAPSHOT.as_posix()})
+        if missing:
+            warnings.append(f'{label}: missing recorded files in {root}: ' + ', '.join(missing))
+        if extra:
+            warnings.append(f'{label}: extra files outside snapshot inventory in {root}: ' + ', '.join(extra))
+    else:
+        warnings.append('Unsealed download; repository identity is inferred from its path and revision is unknown.')
+    summary = card_summary(text, repository.split('/')[-1])
+    if not summary:
+        summary = ('Locally converted GGUF artifact.' if manifest.get('conversion_name') else
+                   'GGUF inference artifact.' if kind == 'GGUF' else 'Source-format model download.')
+        summary += ' No usable model-card summary was found; see the declared metadata below.'
+    dates = []
+    provenance = root / 'archive-provenance'
+    if provenance.is_dir():
+        for path in sorted(provenance.glob('download-*.json')):
+            record = metadata(path)
+            date = record.get('download_completed_at')
+            if isinstance(date, str):
+                dates.append(date)
+            base_model = base_model or record.get('declared_base_model')
+    fingerprint = hashlib.sha256((root / SNAPSHOT).read_bytes()).hexdigest() if sealed else str(root)
+    return {'key': (repository, manifest.get('repository_commit', ''), manifest.get('conversion_name') or '', fingerprint),
+            'repository': repository, 'commit': manifest.get('repository_commit'),
+            'artifact': manifest.get('conversion_name') or ('download' if kind == 'GGUF' else 'source'),
+            'kind': kind, 'sealed': sealed, 'summary': summary, 'architecture': architecture,
+            'dtype': dtype, 'base_model': base_model, 'formats': formats, 'quants': sorted(quants),
+            'card': card,
+            'quantization': quantization, 'converter': recipe.get('converter') if isinstance(recipe, dict) else None,
+            'complete_repository': assessment.get('complete_repository'), 'dates': sorted(dates),
+            'warnings': warnings, 'locations': [{'label': label, 'path': root,
+                'bytes': sum(files.values()), 'files': len(files),
+                'weight_bytes': sum(files[n] for n in weight_names)}]}
+
+
+def scan_root(root: Path, label: str) -> tuple[list[dict], list[dict]]:
+    if not root.is_dir():
+        raise ValueError(f'{label} root is unavailable: {root}; previous catalog was not updated')
+    models, packages = [], []
+    for prefix, kind in LAYOUTS.items():
+        base = root / prefix
+        if base.is_symlink() or (root / Path(prefix).parts[0]).is_symlink():
+            raise ValueError(f'Layout directory must not be a symlink: {base}')
+        if not base.exists():
+            continue
+        if not base.is_dir():
+            raise ValueError(f'Layout path is not a directory: {base}')
+        for directory, dirs, files in walk(base):
+            if 'archive-provenance' in dirs:
+                dirs.remove('archive-provenance')
+            for name in files:
+                file = directory / name
+                if name.endswith(('.tar', '.tar.zst')) and not file.is_symlink():
+                    packages.append({'label': label, 'path': file, 'bytes': file.stat().st_size})
+            if ((directory / SNAPSHOT).exists() or (directory / SNAPSHOT).is_symlink()
+                    or any(Path(n).suffix.lower() in WEIGHTS for n in files)
+                    or 'config.json' in files or 'adapter_config.json' in files):
+                models.append(summarize_model(directory, base, label, kind))
+                # Legacy owner/model folders may coexist with new commit children.
+                dirs[:] = [] if (directory / SNAPSHOT).exists() else [d for d in dirs if re.fullmatch(r'[0-9a-f]{40}', d)]
+    # Optional cold-storage packages moved out of the organized model trees.
+    archives = root / 'archives'
+    if archives.is_dir() and not archives.is_symlink():
+        for directory, dirs, files in walk(archives):
+            for name in files:
+                file = directory / name
+                if name.endswith(('.tar', '.tar.zst')) and not file.is_symlink():
+                    packages.append({'label': label, 'path': file, 'bytes': file.stat().st_size})
+    return models, packages
+
+
+def human_size(value: int) -> str:
+    size = float(value)
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'):
+        if size < 1024 or unit == 'PiB':
+            return f'{size:.1f} {unit}'
+        size /= 1024
+
+
+def link(path: Path, output: Path | None) -> str:
+    relative = os.path.relpath(path, output.parent) if output else str(path)
+    return f'[{plain(path)}](<{quote(relative, safe="/")}>)'
+
+
+def render(models: list[dict], packages: list[dict], roots: list[tuple[str, Path]], output: Path | None) -> str:
+    grouped = {}
+    for model in models:
+        key = model['key']
+        if key not in grouped:
+            grouped[key] = {**model, 'locations': list(model['locations']), 'warnings': list(model['warnings'])}
+        else:
+            grouped[key]['locations'].extend(model['locations'])
+            grouped[key]['warnings'] = sorted(set(grouped[key]['warnings'] + model['warnings']))
+    entries = [grouped[key] for key in sorted(grouped)]
+    lines = [MARKER, '# Downloaded model catalog', '',
+             'Generated: ' + datetime.now(timezone.utc).isoformat(timespec='seconds'), '',
+             'Generated file; rerun model-catalog to refresh. Keep personal notes elsewhere.', '',
+             'Offline metadata scan only: model weights were not read or checksummed. '
+             'Sealed means a snapshot manifest is present, not that integrity was verified. '
+             'Summaries quote saved model-card prose when available; precision and quantization are declarations or filename labels.', '',
+             f'{len(entries)} model revisions/artifacts; {len(models)} directory copies; {len(packages)} packaged files.', '',
+             '## Scanned storage', '', '| Storage | Root |', '|---|---|']
+    lines += [f'| {plain(label)} | {link(root, output)} |' for label, root in roots]
+    lines += ['', '## Models', '', '| Model | Revision | Artifact | Formats | Copies |', '|---|---|---|---|---|']
+    for i, entry in enumerate(entries, 1):
+        lines.append(f'| [{plain(entry["repository"])}](#model-{i}) | {plain((entry["commit"] or "Unknown")[:12])} | '
+                     f'{plain(entry["artifact"])} | {plain(", ".join(entry["formats"]))} | '
+                     f'{plain(", ".join(loc["label"] for loc in entry["locations"]))} |')
+    if not entries:
+        lines += ['', 'No model directories found in the supported layouts.']
+    for i, entry in enumerate(entries, 1):
+        lines += ['', f'<a id="model-{i}"></a>', f'### {plain(entry["repository"])} — {plain(entry["artifact"])}', '',
+                  plain(entry['summary']), '', '| Field | Value |', '|---|---|',
+                  f'| Snapshot | {"Sealed (not verified)" if entry["sealed"] else "Unsealed"} |',
+                  f'| Revision | {plain(entry["commit"])} |',
+                  f'| Architecture | {plain(entry["architecture"])} |',
+                  f'| Source/config declared dtype | {plain(entry["dtype"])} |',
+                  f'| Model-card task | {plain(entry["card"].get("pipeline_tag"))} |',
+                  f'| Model-card language | {plain(entry["card"].get("language"))} |',
+                  f'| Model-card license | {plain(entry["card"].get("license"))} |',
+                  f'| GGUF labels (filenames) | {plain(", ".join(entry["quants"]))} |',
+                  f'| Declared quantization | {plain(entry["quantization"])} |',
+                  f'| Base model | {plain(entry["base_model"])} |',
+                  f'| Whole repository selected | {plain(entry["complete_repository"])} |',
+                  f'| Download completion (UTC) | {plain(", ".join(entry["dates"]))} |']
+        if entry['converter']:
+            lines.append(f'| Converter (recorded recipe) | {plain(entry["converter"])} |')
+        if entry['sealed'] and re.fullmatch(r'[\w.-]+/[\w.-]+', entry['repository']):
+            url = f'https://huggingface.co/{quote(entry["repository"], safe="/")}/tree/{entry["commit"]}'
+            lines += ['', f'[Repository revision]({url})']
+        lines += ['', '| Storage | Directory | Files | Total size | Weight files size |', '|---|---|---:|---:|---:|']
+        for loc in sorted(entry['locations'], key=lambda loc: (loc['label'], str(loc['path']))):
+            lines.append(f'| {plain(loc["label"])} | {link(loc["path"], output)} | {loc["files"]} | '
+                         f'{human_size(loc["bytes"])} | {human_size(loc["weight_bytes"])} |')
+        if entry['warnings']:
+            lines += ['', 'Recorded readiness / scan notices:', '']
+            lines += ['- ' + plain(warning) for warning in entry['warnings']]
+    lines += ['', '## Packaged archives', '',
+              'Filename and size only; contents, model identity, and checksums were not inspected.', '',
+              '| Storage | Package | Size |', '|---|---|---:|']
+    lines += [f'| {plain(p["label"])} | {link(p["path"], output)} | {human_size(p["bytes"])} |'
+              for p in sorted(packages, key=lambda p: (p['label'], str(p['path'])))]
+    return '\n'.join(lines) + '\n'
+
+
+def check_output(path: Path, models: list[dict]) -> None:
+    if path.is_symlink():
+        raise ValueError(f'Refusing symlink output: {path}')
+    if path.suffix.lower() != '.md':
+        raise ValueError('Catalog output must end in .md')
+    if any(path.is_relative_to(loc['path']) for model in models for loc in model['locations']):
+        raise ValueError(f'Catalog must be outside model snapshot directories: {path}')
+    if path.exists():
+        with path.open('r', encoding='utf-8') as stream:
+            if stream.readline().rstrip('\n') != MARKER:
+                raise ValueError(f'Refusing to replace a file not generated by model-catalog: {path}')
+
+
+def write_catalog(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                     prefix='.model-catalog-', delete=False) as file:
+        pending = Path(file.name)
+        try:
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        except BaseException:
+            pending.unlink(missing_ok=True)
+            raise
+    try:
+        pending.replace(path)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    data = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local/share'))
+    parser.add_argument('--local-root', type=Path, default=Path(os.environ.get('HF_MODEL_DOWNLOAD_ROOT', data / 'hf-model-archives')))
+    parser.add_argument('--nas-root', type=Path, default=Path(os.environ.get('AI_MODELS_NAS_ROOT', '/mnt/ai-models')))
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument('--local-only', action='store_true', help='Scan only local storage.')
+    target.add_argument('--nas-only', action='store_true', help='Scan only NAS storage.')
+    parser.add_argument('--output', type=Path, action='append', help='Generated Markdown file; repeat to mirror the catalog. Default: LOCAL_ROOT/MODEL-CATALOG.md (NAS_ROOT with --nas-only).')
+    parser.add_argument('--stdout', action='store_true', help='Preview Markdown without writing a file.')
+    args = parser.parse_args()
+    if args.stdout and args.output:
+        parser.error('--stdout cannot be combined with --output')
+    roots = []
+    if not args.nas_only:
+        roots.append(('Local', args.local_root.expanduser().resolve()))
+    if not args.local_only:
+        roots.append(('NAS', args.nas_root.expanduser().resolve()))
+    if len(roots) == 2 and (roots[0][1].is_relative_to(roots[1][1]) or roots[1][1].is_relative_to(roots[0][1])):
+        parser.error('Local and NAS roots must be separate and non-overlapping')
+    models, packages = [], []
+    for label, root in roots:
+        found, packed = scan_root(root, label)
+        models.extend(found)
+        packages.extend(packed)
+    if args.stdout:
+        print(render(models, packages, roots, None), end='')
+        return 0
+    outputs = args.output or [roots[0][1] / 'MODEL-CATALOG.md']
+    # Resolve parents, preserving a final symlink so check_output can reject it.
+    outputs = list(dict.fromkeys(path.expanduser().parent.resolve() / path.name for path in outputs))
+    for output in outputs:
+        check_output(output, models)
+    for output in outputs:
+        write_catalog(output, render(models, packages, roots, output))
+        print(f'Updated {output}: {len(models)} directory copies, {len(packages)} packages')
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError) as error:
+        print(f'ERROR: {error}', file=sys.stderr)
+        raise SystemExit(1)

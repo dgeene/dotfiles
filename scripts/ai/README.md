@@ -368,6 +368,73 @@ commands produced the outputs. Use a new conversion name if any output, recipe,
 or input changes. Downloaded third-party GGUF provenance records its publisher's
 revision; it does not invent a conversion recipe.
 
+## Markdown download catalog
+
+`model-catalog` scans local and NAS storage offline and creates or updates a
+Markdown catalog. It needs only Python 3.9+ and does not modify model snapshots.
+Run it from the repository root:
+
+```sh
+# Scan both roots; write LOCAL_ROOT/MODEL-CATALOG.md
+./bin/model-catalog --local-root /storage/hf-model-archives --nas-root /mounted/ai-models
+
+# Scan just local storage using the archiver's existing defaults/environment
+./bin/model-catalog --local-only
+
+# Save a combined catalog on both storage systems
+./bin/model-catalog --local-root /storage/hf-model-archives --nas-root /mounted/ai-models \
+  --output /storage/hf-model-archives/MODEL-CATALOG.md \
+  --output /mounted/ai-models/MODEL-CATALOG.md
+
+# Read-only preview; --nas-only similarly limits scanning to the NAS
+./bin/model-catalog --local-only --stdout
+```
+
+The implementation is `scripts/ai/catalog-hf-models`; `bin/model-catalog` is a
+symlink to it. Both entry points accept the same flags. Roots use the same
+`HF_MODEL_DOWNLOAD_ROOT`, `AI_MODELS_NAS_ROOT`, and XDG defaults as the archiver.
+With `--nas-only`, the default output is `NAS_ROOT/MODEL-CATALOG.md`.
+For remote storage, run the command on that machine or use a locally mounted
+path; roots are filesystem paths, not SSH URLs.
+
+The index includes a model overview and a section per revision/artifact with:
+
+- A short excerpt from the archived model card, with a metadata-based fallback.
+- Repository/revision links, source versus GGUF artifacts, formats, and filename
+  quantization labels. Identical snapshot manifests share an entry listing both
+  local and NAS copies; different revisions, selections, and recipes stay separate.
+- Declared architecture/dtype, base model, task, language, license, recorded
+  conversion tool, download timestamps, and readiness warnings where available.
+- Each copy's directory, file count, total file size, and weight-file size.
+  Sizes are logical file sizes, not disk allocation or runtime memory estimates.
+- A separate filename/size list for `.tar` and `.tar.zst` packages.
+
+The scan covers `source/huggingface` and `inference/gguf`, plus packages under
+`archives`. Older weight/config directories within these layouts are listed as
+**unsealed**, with unknown revisions and path-inferred repository names. Arbitrary
+flat directories and the Hugging Face Hub cache are not cataloged. Hidden staging
+directories and nested directory symlinks are skipped; a symlink for the storage
+root itself is supported. Model cards/configs are read in bounded amounts;
+weights are only statted, and tar packages are never decompressed.
+
+This is a catalog, not checksum verification: sealed entries have a manifest,
+but the scan does not prove their bytes match. Missing/extra recorded files are
+flagged. Model-card prose and metadata are publisher declarations, not independently
+verified capabilities or hardware requirements. Simple scalar/list card fields
+are supported without requiring a YAML library; complex YAML remains unknown.
+
+Rerun the command to refresh the catalog after downloads, copies, or removals.
+Each output is replaced atomically only after a successful scan. Missing roots,
+unreadable files, or malformed metadata cause failure and preserve the previous
+catalog. Use `--local-only` when the NAS is unavailable instead of publishing an
+incomplete combined catalog. Ensure the NAS is actually mounted: an existing
+empty mount directory cannot be distinguished from an intentionally empty archive.
+
+Outputs must end in `.md` and stay outside model directories. The command only
+replaces files bearing its generated-file marker, protecting unrelated Markdown
+documents. Generated catalogs should live on storage outside this repository;
+keep personal notes in a separate file because refresh replaces generated content.
+
 ## Hardware requirements for inference
 
 An archived model needs both a compatible runtime/GPU and enough memory to run.
