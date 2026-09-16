@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an offline Markdown catalog of downloaded model directories and packages."""
+"""Build a Markdown model catalog; optionally check upstream Hugging Face revisions."""
 from __future__ import annotations
 
 import argparse
@@ -13,7 +13,7 @@ import re
 import stat
 import sys
 import tempfile
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 MARKER = '<!-- model-catalog:v1 -->'
 LAYOUTS = {'source/huggingface': 'Source', 'inference/gguf': 'GGUF'}
@@ -163,8 +163,10 @@ def summarize_model(root: Path, base: Path, label: str, kind: str) -> dict:
     text = card_text(root)
     card = card_fields(text)
     conversion = metadata(root / 'archive-provenance/conversion.json', optional=True)
+    source_manifest = (metadata(root / 'archive-provenance/source-snapshot.json', optional=True)
+                       if manifest.get('conversion_name') else manifest)
     if manifest.get('conversion_name') and not assessment:
-        assessment = metadata(root / 'archive-provenance/source-snapshot.json', optional=True).get('source_assessment') or {}
+        assessment = source_manifest.get('source_assessment') or {}
         if not isinstance(assessment, dict):
             raise ValueError(f'Invalid conversion source assessment: {root}')
     request = manifest.get('request') or {}
@@ -206,7 +208,7 @@ def summarize_model(root: Path, base: Path, label: str, kind: str) -> dict:
         summary = ('Locally converted GGUF artifact.' if manifest.get('conversion_name') else
                    'GGUF inference artifact.' if kind == 'GGUF' else 'Source-format model download.')
         summary += ' No usable model-card summary was found; see the declared metadata below.'
-    dates = []
+    dates, tracking = [], []
     provenance = root / 'archive-provenance'
     if provenance.is_dir():
         for path in sorted(provenance.glob('download-*.json')):
@@ -215,6 +217,11 @@ def summarize_model(root: Path, base: Path, label: str, kind: str) -> dict:
             if isinstance(date, str):
                 dates.append(date)
             base_model = base_model or record.get('declared_base_model')
+            if record.get('repository') == repository and record.get('repository_commit') == manifest.get('repository_commit'):
+                tracking.append((str(date or ''), path.name, record))
+    tracked = sorted(tracking)[-1][2] if tracking else {}
+    requested = tracked.get('requested_revision')
+    saved_ref = requested if isinstance(requested, str) and requested and not re.fullmatch(r'[0-9a-fA-F]{7,40}', requested) else None
     fingerprint = hashlib.sha256((root / SNAPSHOT).read_bytes()).hexdigest() if sealed else str(root)
     return {'key': (repository, manifest.get('repository_commit', ''), manifest.get('conversion_name') or '', fingerprint),
             'repository': repository, 'commit': manifest.get('repository_commit'),
@@ -224,6 +231,10 @@ def summarize_model(root: Path, base: Path, label: str, kind: str) -> dict:
             'card': card,
             'quantization': quantization, 'converter': recipe.get('converter') if isinstance(recipe, dict) else None,
             'complete_repository': assessment.get('complete_repository'), 'dates': sorted(dates),
+            'upstream_ref': saved_ref, 'source_url': tracked.get('source_url'),
+            'upstream_selection': [n for n in source_manifest.get('files', {}) if not n.startswith('archive-provenance/')]
+                if source_manifest else None,
+            'is_conversion': bool(manifest.get('conversion_name')),
             'warnings': warnings, 'locations': [{'label': label, 'path': root,
                 'bytes': sum(files.values()), 'files': len(files),
                 'weight_bytes': sum(files[n] for n in weight_names)}]}
@@ -265,6 +276,185 @@ def scan_root(root: Path, label: str) -> tuple[list[dict], list[dict]]:
     return models, packages
 
 
+def make_hub_api():
+    # The default offline scan has no SDK dependency or authentication access.
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as error:
+        raise ValueError('--check-upstream requires huggingface_hub in the Python environment running model-catalog; see the README') from error
+    api = HfApi()
+    endpoint = urlsplit(api.endpoint)
+    if endpoint.scheme not in {'http', 'https'} or not endpoint.netloc or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment:
+        raise ValueError('HF_ENDPOINT must be an HTTP(S) URL without credentials, query, or fragment')
+    return api
+
+
+def upstream_error(error: Exception) -> str:
+    """Never embed raw HTTP exception messages, URLs, or credentials in catalogs."""
+    status = getattr(getattr(error, 'response', None), 'status_code', None)
+    if status in (401, 403):
+        return f'Access denied (HTTP {status}); check Hub login and repository access'
+    if status == 404:
+        return 'Repository or revision unavailable (HTTP 404; may require authentication)'
+    if status == 429:
+        return 'Hub rate limit reached (HTTP 429); retry later'
+    return f'Upstream request or metadata unavailable ({type(error).__name__})'
+
+
+def change_category(name: str) -> str:
+    path, lower = Path(name), Path(name).name.lower()
+    if lower.startswith(('tokenizer', 'vocab', 'merges', 'special_tokens', 'added_tokens', 'chat_template')):
+        return 'Runtime/config/tokenizer'
+    if path.suffix.lower() in WEIGHTS or lower.endswith(('.safetensors.index.json', '.bin.index.json')):
+        return 'Weights/indexes'
+    if path.suffix.lower() in {'.md', '.rst'} or lower.startswith(('readme', 'license', 'copying', 'notice')):
+        return 'Documentation/license'
+    if path.suffix.lower() in {'.json', '.py', '.jinja', '.jinja2', '.model', '.tiktoken', '.yaml', '.yml'}:
+        return 'Runtime/config/tokenizer'
+    return 'Other'
+
+
+class UpstreamChecker:
+    def __init__(self, api):
+        self.api = api
+        self.cache = {}
+
+    def cached(self, key, fetch):
+        if key not in self.cache:
+            try:
+                self.cache[key] = fetch()
+            except Exception as error:
+                # Cache failures too: duplicate local/NAS entries must not retry a rate limit.
+                self.cache[key] = error
+        result = self.cache[key]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def commits(self, repo, sha):
+        def fetch():
+            values = self.api.list_repo_commits(repo, revision=sha)
+            commits = {c.commit_id: c for c in values}
+            if sha not in commits:
+                raise ValueError('Incomplete revision history')
+            return commits
+        return self.cached(('commits', repo, sha), fetch)
+
+    def tree(self, repo, sha):
+        def fetch():
+            files = {}
+            # The SDK follows tree pagination; comparisons always use pinned SHAs.
+            for item in self.api.list_repo_tree(repo, revision=sha, recursive=True):
+                if hasattr(item, 'blob_id'):
+                    if not item.blob_id or not isinstance(item.path, str):
+                        raise ValueError('Incomplete file metadata')
+                    files[item.path] = item.blob_id
+            return files
+        return self.cached(('tree', repo, sha), fetch)
+
+    def check(self, model, revision=None):
+        ref = revision or model.get('upstream_ref') or 'main'
+        result = {'ref': ref, 'ref_basis': 'explicit override' if revision else
+                  'saved download revision' if model.get('upstream_ref') else 'main fallback (no saved branch/tag)',
+                  'checked_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                  'scope': 'Source checkpoint for local conversion' if model.get('is_conversion') else 'Downloaded repository',
+                  'status': 'Unknown', 'latest': None, 'behind': None, 'changes': None, 'notes': [],
+                  'endpoint': self.api.endpoint.rstrip('/')}
+        repo, archived = model['repository'], model['commit']
+        if not model['sealed'] or not archived:
+            result['notes'].append('No sealed revision; upstream comparison was skipped')
+            return result
+        if not re.fullmatch(r'[\w.-]+/[\w.-]+', repo) or any(p in {'.', '..'} for p in repo.split('/')):
+            result['notes'].append('Invalid saved repository identity; comparison was skipped')
+            return result
+        source_url = model.get('source_url')
+        # Only use the explicitly configured SDK endpoint, never a server chosen by model metadata.
+        if source_url:
+            expected = result['endpoint'] + '/' + repo
+            source = urlsplit(source_url) if isinstance(source_url, str) else None
+            if source is None or source_url.rstrip('/') != expected or source.username or source.password or source.query or source.fragment:
+                result['notes'].append('Saved source URL differs from configured HF_ENDPOINT; comparison was skipped')
+                return result
+        try:
+            info = self.cached(('head', repo, ref), lambda: self.api.model_info(repo, revision=ref, timeout=30))
+            head = info.sha
+            if not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}', head):
+                raise ValueError('Invalid head SHA')
+            result['latest'] = head
+        except Exception as error:
+            result['status'] = 'Unavailable'
+            result['notes'].append(upstream_error(error))
+            return result
+        if head == archived:
+            result.update(status='Current', behind=0, changes=[])
+            return result
+        result['status'] = 'Revision differs'
+        try:
+            history = self.commits(repo, head)
+            if archived not in history:
+                result['status'] = 'Diverged/unknown ancestry'
+                result['notes'].append('Archived SHA is absent from the selected revision history; no commits-behind count is asserted')
+            else:
+                previous = self.commits(repo, archived)
+                if head in previous or not previous.keys() <= history.keys():
+                    raise ValueError('Inconsistent revision histories')
+                # Set difference handles merged branches and non-monotonic commit dates.
+                result['behind'] = len(history.keys() - previous.keys())
+                result['status'] = f'{result["behind"]} commit{"s" if result["behind"] != 1 else ""} behind'
+        except Exception as error:
+            result['notes'].append('Commit count: ' + upstream_error(error))
+        try:
+            before, after = self.tree(repo, archived), self.tree(repo, head)
+            selected = model.get('upstream_selection')
+            selected = set(selected) if selected is not None else None
+            result['changes'] = [
+                {'path': name, 'change': 'added' if name not in before else 'removed' if name not in after else 'modified',
+                 'category': change_category(name), 'selected': name in selected if selected is not None else None}
+                for name in sorted(before.keys() | after.keys()) if before.get(name) != after.get(name)
+            ]
+        except Exception as error:
+            result['notes'].append('File comparison: ' + upstream_error(error))
+        return result
+
+
+def check_upstream(models: list[dict], revision: str | None = None) -> None:
+    checker = UpstreamChecker(make_hub_api())
+    for model in models:
+        model['upstream'] = checker.check(model, revision)
+
+
+def upstream_markdown(result: dict) -> list[str]:
+    lines = ['', '#### Upstream comparison', '', '| Field | Value |', '|---|---|',
+             f'| Status | {plain(result["status"])} |',
+             f'| Comparison scope | {plain(result["scope"])} |',
+             f'| Endpoint | {plain(result["endpoint"])} |',
+             f'| Tracked revision | {plain(result["ref"])} ({plain(result["ref_basis"])}) |',
+             f'| Latest SHA | {plain(result["latest"])} |',
+             f'| Commits behind | {plain(result["behind"])} |',
+             f'| Checked at (UTC) | {plain(result["checked_at"])} |']
+    changes = result['changes']
+    if changes is None:
+        lines += ['', 'File changes: unknown.']
+    elif not changes:
+        lines += ['', 'No repository file differences between these revisions.']
+    else:
+        counts = {}
+        for change in changes:
+            counts[change['category']] = counts.get(change['category'], 0) + 1
+        lines += ['', 'Changed-file categories: ' + '; '.join(f'{category}: {count}' for category, count in sorted(counts.items())) + '.', '',
+                  '| File | Change | Category | Previously archived path |', '|---|---|---|---|']
+        # Bound Markdown growth for repositories with thousands of changed files.
+        for change in changes[:100]:
+            selected = 'Unknown' if change['selected'] is None else 'Yes' if change['selected'] else 'No'
+            lines.append(f'| {plain(change["path"])} | {change["change"]} | {change["category"]} | {selected} |')
+        if len(changes) > 100:
+            lines += ['', f'Showing 100 of {len(changes)} changed paths; category counts include all changes.']
+        lines += ['', 'Changes compare complete upstream trees. Added files and files outside the archived selection are still shown.']
+    if result['notes']:
+        lines += [''] + ['- ' + plain(note) for note in result['notes']]
+    return lines
+
+
 def human_size(value: int) -> str:
     size = float(value)
     for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'):
@@ -279,6 +469,7 @@ def link(path: Path, output: Path | None) -> str:
 
 
 def render(models: list[dict], packages: list[dict], roots: list[tuple[str, Path]], output: Path | None) -> str:
+    online = any('upstream' in model for model in models)
     grouped = {}
     for model in models:
         key = model['key']
@@ -291,17 +482,20 @@ def render(models: list[dict], packages: list[dict], roots: list[tuple[str, Path
     lines = [MARKER, '# Downloaded model catalog', '',
              'Generated: ' + datetime.now(timezone.utc).isoformat(timespec='seconds'), '',
              'Generated file; rerun model-catalog to refresh. Keep personal notes elsewhere.', '',
-             'Offline metadata scan only: model weights were not read or checksummed. '
+             ('Local scan with online upstream metadata checks: ' if online else 'Offline metadata scan only: ') +
+             'model weights were not read or checksummed. '
              'Sealed means a snapshot manifest is present, not that integrity was verified. '
              'Summaries quote saved model-card prose when available; precision and quantization are declarations or filename labels.', '',
              f'{len(entries)} model revisions/artifacts; {len(models)} directory copies; {len(packages)} packaged files.', '',
              '## Scanned storage', '', '| Storage | Root |', '|---|---|']
     lines += [f'| {plain(label)} | {link(root, output)} |' for label, root in roots]
-    lines += ['', '## Models', '', '| Model | Revision | Artifact | Formats | Copies |', '|---|---|---|---|---|']
+    lines += ['', '## Models', '', '| Model | Revision | Artifact | Formats | Copies |' + (' Upstream |' if online else ''),
+              '|---|---|---|---|---|' + ('---|' if online else '')]
     for i, entry in enumerate(entries, 1):
         lines.append(f'| [{plain(entry["repository"])}](#model-{i}) | {plain((entry["commit"] or "Unknown")[:12])} | '
                      f'{plain(entry["artifact"])} | {plain(", ".join(entry["formats"]))} | '
-                     f'{plain(", ".join(loc["label"] for loc in entry["locations"]))} |')
+                     f'{plain(", ".join(loc["label"] for loc in entry["locations"]))} |' +
+                     (f' {plain(entry.get("upstream", {}).get("status", "Not checked"))} |' if online else ''))
     if not entries:
         lines += ['', 'No model directories found in the supported layouts.']
     for i, entry in enumerate(entries, 1):
@@ -324,6 +518,8 @@ def render(models: list[dict], packages: list[dict], roots: list[tuple[str, Path
         if entry['sealed'] and re.fullmatch(r'[\w.-]+/[\w.-]+', entry['repository']):
             url = f'https://huggingface.co/{quote(entry["repository"], safe="/")}/tree/{entry["commit"]}'
             lines += ['', f'[Repository revision]({url})']
+        if 'upstream' in entry:
+            lines += upstream_markdown(entry['upstream'])
         lines += ['', '| Storage | Directory | Files | Total size | Weight files size |', '|---|---|---:|---:|---:|']
         for loc in sorted(entry['locations'], key=lambda loc: (loc['label'], str(loc['path']))):
             lines.append(f'| {plain(loc["label"])} | {link(loc["path"], output)} | {loc["files"]} | '
@@ -380,9 +576,13 @@ def main() -> int:
     target.add_argument('--nas-only', action='store_true', help='Scan only NAS storage.')
     parser.add_argument('--output', type=Path, action='append', help='Generated Markdown file; repeat to mirror the catalog. Default: LOCAL_ROOT/MODEL-CATALOG.md (NAS_ROOT with --nas-only).')
     parser.add_argument('--stdout', action='store_true', help='Preview Markdown without writing a file.')
+    parser.add_argument('--check-upstream', action='store_true', help='Query Hub revision/history/file metadata and add freshness results; requires huggingface_hub.')
+    parser.add_argument('--upstream-revision', help='Override the tracked branch/tag for every repository (requires --check-upstream). Default: saved download ref, or main.')
     args = parser.parse_args()
     if args.stdout and args.output:
         parser.error('--stdout cannot be combined with --output')
+    if args.upstream_revision is not None and (not args.check_upstream or not args.upstream_revision.strip()):
+        parser.error('--upstream-revision requires --check-upstream and a nonempty revision')
     roots = []
     if not args.nas_only:
         roots.append(('Local', args.local_root.expanduser().resolve()))
@@ -395,14 +595,16 @@ def main() -> int:
         found, packed = scan_root(root, label)
         models.extend(found)
         packages.extend(packed)
-    if args.stdout:
-        print(render(models, packages, roots, None), end='')
-        return 0
-    outputs = args.output or [roots[0][1] / 'MODEL-CATALOG.md']
+    outputs = [] if args.stdout else args.output or [roots[0][1] / 'MODEL-CATALOG.md']
     # Resolve parents, preserving a final symlink so check_output can reject it.
     outputs = list(dict.fromkeys(path.expanduser().parent.resolve() / path.name for path in outputs))
     for output in outputs:
         check_output(output, models)
+    if args.check_upstream:
+        check_upstream(models, args.upstream_revision)
+    if args.stdout:
+        print(render(models, packages, roots, None), end='')
+        return 0
     for output in outputs:
         write_catalog(output, render(models, packages, roots, output))
         print(f'Updated {output}: {len(models)} directory copies, {len(packages)} packages')

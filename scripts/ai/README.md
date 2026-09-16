@@ -370,8 +370,8 @@ revision; it does not invent a conversion recipe.
 
 ## Markdown download catalog
 
-`model-catalog` scans local and NAS storage offline and creates or updates a
-Markdown catalog. It needs only Python 3.9+ and does not modify model snapshots.
+`model-catalog` scans local and NAS storage offline by default and creates or updates a
+Markdown catalog. The offline scan needs only Python 3.9+ and does not modify model snapshots.
 Run it from the repository root:
 
 ```sh
@@ -434,6 +434,91 @@ Outputs must end in `.md` and stay outside model directories. The command only
 replaces files bearing its generated-file marker, protecting unrelated Markdown
 documents. Generated catalogs should live on storage outside this repository;
 keep personal notes in a separate file because refresh replaces generated content.
+
+### Check whether archived revisions are behind upstream
+
+Add `--check-upstream` to query Hugging Face metadata and include an upstream
+status column and detailed comparison for each sealed snapshot:
+
+```sh
+# Refresh the combined local/NAS index, including upstream status
+./bin/model-catalog --check-upstream
+
+# Check local archives and preview the result without writing an index
+./bin/model-catalog --local-only --check-upstream --stdout
+
+# Explicitly compare every archived repository against main
+./bin/model-catalog --check-upstream --upstream-revision main
+```
+
+Online checks require the `huggingface_hub` Python package **in the interpreter
+running the catalog**. This may already be installed with `hf`; an isolated
+`hf` installation via pipx or `uv tool` does not make it importable in every
+Python environment. If needed, create a virtual environment, install a compatible
+`huggingface_hub` there, and invoke the script with that environment's Python.
+For example, with `uv` available:
+
+```sh
+uv run --with huggingface_hub python scripts/ai/catalog-hf-models \
+  --local-only --check-upstream
+```
+
+The SDK uses its normal `HF_TOKEN` / saved Hub login and `HF_ENDPOINT` settings.
+Credentials are never written into the catalog. A saved source URL that does
+not match the configured endpoint is skipped rather than automatically contacting
+a server named by archive metadata. Without `--check-upstream`, the SDK is not
+imported and there are no network or authentication calls.
+
+The comparison includes:
+
+- **Tracked revision:** `--upstream-revision` overrides all models. Otherwise the
+  most recent matching download record's branch/tag is used. A missing record or
+  a pinned SHA falls back to `main`, explicitly labeled in the result. A saved tag
+  remains a tag comparison; use `--upstream-revision main` to check a moving branch.
+- **Latest SHA and check time:** the selected ref is resolved once per repository
+  per scan. History and file-tree requests are pinned to that SHA so a branch
+  update during the scan cannot mix revisions.
+- **Commits behind:** `Current` means the SHAs match. Otherwise the complete Hub
+  histories are compared, counting commits reachable from the selected revision
+  but not the archived revision. This avoids relying on download dates or a
+  commit's position in a date-sorted list. If the archived SHA is absent from
+  that history, the status is `Diverged/unknown ancestry` and the count stays
+  unknown; it is never guessed from timestamps.
+- **Changed files:** added, removed, and modified paths are detected by comparing
+  upstream Git blob IDs, including LFS pointer blobs. Categories distinguish
+  weights/indexes, runtime/config/tokenizer files, documentation/license files,
+  and other changes. This is a comparison of two upstream trees, not a checksum
+  comparison against the local bytes. A metadata-only change to an LFS pointer
+  may count as a changed file even when its tensor payload is unchanged.
+- **Selection impact:** each changed path is marked if it was previously archived.
+  The comparison still shows newly added files and changes outside filtered
+  selections. It lists up to 100 changed paths, with category totals covering all
+  changes. An empty file diff can occur even when commit history advanced.
+
+Downloaded third-party GGUFs are compared against **their publisher's repository**.
+Locally converted GGUFs compare the recorded **source repository and source commit**,
+using the embedded source manifest to identify previously archived paths. That
+checks whether the source changed; it does not check for newer converter software,
+re-run quantization, or promise that a new conversion would be better. Unsealed
+downloads have no authoritative revision and are not compared. Tar packages are
+still only listed by filename and size.
+
+Requests read repository metadata only: no model files are downloaded, no weights
+are read, and snapshots remain unchanged. Matching local/NAS copies and repeated
+repository revisions reuse request results within the scan. The SDK handles
+pagination; repositories with long histories or many files can take longer.
+
+Authentication errors, missing repositories/revisions, rate limits, timeouts,
+and incomplete responses are rendered as **Unavailable/Unknown**, with the check
+time. A history failure can leave file differences available, and a file-tree
+failure can leave a commits-behind count available; missing results are never
+rendered as zero changes. Such per-repository failures do not abort the catalog
+update: a successful scan exits zero and includes explicit failure notes. A
+missing SDK or local scan failure still aborts before replacing the index.
+
+Each catalog regeneration is a fresh report. A later offline scan omits upstream
+results instead of retaining stale statuses. Upstream checks do not refresh
+snapshots automatically; use the archiver to preserve a new revision separately.
 
 ## Hardware requirements for inference
 

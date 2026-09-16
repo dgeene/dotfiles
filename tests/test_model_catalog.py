@@ -8,8 +8,9 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 loader = importlib.machinery.SourceFileLoader('model_catalog', str(Path(__file__).resolve().parents[1] / 'scripts/ai/catalog-hf-models'))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -221,6 +222,203 @@ class CatalogTests(unittest.TestCase):
     def test_description_preferred_over_generic_announcement(self):
         text = '# Example\n\nWe are pleased to announce the newest generation of our open-model family.\n\nExample is a native vision-language model for coding and reasoning.\n'
         self.assertEqual(catalog.card_summary(text, 'Example'), 'Example is a native vision-language model for coding and reasoning.')
+
+    def api(self, current=False):
+        head, side, initial = 'b' * 40, 'c' * 40, '0' * 40
+        api = Mock()
+        api.endpoint = 'https://huggingface.co'
+        api.model_info.return_value = SimpleNamespace(sha=COMMIT if current else head)
+        # A merged commit can occur after the ancestor in date-sorted history.
+        api.list_repo_commits.side_effect = lambda repo, revision: [SimpleNamespace(commit_id=c) for c in
+            ([head, COMMIT, side, initial] if revision == head else [COMMIT, initial])]
+        old = {'model.safetensors': 'old-weights', 'README.md': 'old-card', 'tokenizer.json': 'old-tokenizer'}
+        new = {'model.safetensors': 'new-weights', 'README.md': 'new-card', 'LICENSE': 'new-license'}
+        api.list_repo_tree.side_effect = lambda repo, revision, recursive: iter([
+            SimpleNamespace(path=n, blob_id=h) for n, h in (old if revision == COMMIT else new).items()])
+        return api
+
+    def test_offline_never_initializes_hub_client(self):
+        self.model()
+        with patch.object(catalog, 'make_hub_api', side_effect=AssertionError('network access')):
+            text = self.cli('--stdout')
+        self.assertNotIn('Upstream comparison', text)
+
+    def test_upstream_current_skips_history_and_tree(self):
+        self.model()
+        api = self.api(current=True)
+        with patch.object(catalog, 'make_hub_api', return_value=api):
+            text = self.cli('--check-upstream', '--stdout')
+        self.assertIn('| Status | Current |', text)
+        self.assertIn('| Commits behind | 0 |', text)
+        self.assertIn('main fallback', text)
+        api.list_repo_commits.assert_not_called()
+        api.list_repo_tree.assert_not_called()
+
+    def test_upstream_changes_history_sets_and_cache_across_copies(self):
+        source = self.model()
+        shutil.copytree(source, self.nas / source.relative_to(self.local))
+        api = self.api()
+        with patch.object(catalog, 'make_hub_api', return_value=api):
+            text = self.cli('--check-upstream', '--stdout')
+        self.assertIn('2 commits behind', text)
+        self.assertIn('Weights/indexes: 1', text)
+        self.assertIn('Documentation/license: 2', text)
+        self.assertIn('Runtime/config/tokenizer: 1', text)
+        self.assertIn('| LICENSE | added | Documentation/license | No |', text)
+        self.assertIn('| tokenizer.json | removed | Runtime/config/tokenizer | No |', text)
+        self.assertIn('| model.safetensors | modified | Weights/indexes | Yes |', text)
+        self.assertEqual(api.model_info.call_count, 1)
+        self.assertEqual(api.list_repo_tree.call_count, 2)
+        self.assertEqual(api.list_repo_commits.call_count, 2)
+        self.assertTrue(all(c.kwargs['revision'] in {COMMIT, 'b' * 40} for c in api.list_repo_tree.call_args_list))
+
+    def test_upstream_absent_ancestor_is_not_reported_as_behind(self):
+        self.model()
+        api = self.api()
+        api.list_repo_commits.side_effect = None
+        api.list_repo_commits.return_value = [SimpleNamespace(commit_id='b' * 40)]
+        with patch.object(catalog, 'make_hub_api', return_value=api):
+            text = self.cli('--check-upstream', '--stdout')
+        self.assertIn('Diverged/unknown ancestry', text)
+        self.assertIn('| Commits behind | Unknown |', text)
+        self.assertIn('Weights/indexes: 1', text)
+
+    def test_upstream_failed_history_can_still_compare_files(self):
+        self.model()
+        api = self.api()
+        api.list_repo_commits.side_effect = TimeoutError('never print this message')
+        with patch.object(catalog, 'make_hub_api', return_value=api):
+            text = self.cli('--check-upstream', '--stdout')
+        self.assertIn('Revision differs', text)
+        self.assertIn('Commit count:', text)
+        self.assertIn('Weights/indexes: 1', text)
+        self.assertNotIn('never print this message', text)
+
+    def test_upstream_failed_file_comparison_remains_unknown(self):
+        self.model()
+        api = self.api()
+        api.list_repo_tree.side_effect = OSError('network failure')
+        with patch.object(catalog, 'make_hub_api', return_value=api):
+            text = self.cli('--check-upstream', '--stdout')
+        self.assertIn('2 commits behind', text)
+        self.assertIn('File changes: unknown', text)
+        self.assertNotIn('No repository file differences', text)
+
+    def test_upstream_error_reports_are_sanitized_and_cached(self):
+        source = self.model()
+        shutil.copytree(source, self.nas / source.relative_to(self.local))
+        for code, message in [(401, 'Access denied'), (403, 'Access denied'), (404, 'unavailable'), (429, 'rate limit')]:
+            api = self.api()
+            error = RuntimeError('credential-must-not-appear')
+            error.response = SimpleNamespace(status_code=code)
+            api.model_info.side_effect = error
+            with patch.object(catalog, 'make_hub_api', return_value=api):
+                text = self.cli('--check-upstream', '--stdout')
+            self.assertIn('Unavailable', text)
+            self.assertIn(message, text)
+            self.assertNotIn('credential-must-not-appear', text)
+            self.assertEqual(api.model_info.call_count, 1)
+
+    def test_upstream_uses_saved_ref_or_override_and_skips_stale_records(self):
+        source = self.model()
+        record = {'repository': 'owner/model', 'repository_commit': COMMIT,
+                  'requested_revision': 'release/v2', 'source_url': 'https://huggingface.co/owner/model'}
+        provenance = source / 'archive-provenance/download-test.json'
+        provenance.write_text(json.dumps(record))
+        for options, expected in [((), 'release/v2'), (('--upstream-revision', 'main'), 'main')]:
+            api = self.api(current=True)
+            with patch.object(catalog, 'make_hub_api', return_value=api):
+                text = self.cli('--check-upstream', '--stdout', *options)
+            api.model_info.assert_called_once_with('owner/model', revision=expected, timeout=30)
+        record['repository_commit'] = 'f' * 40
+        provenance.write_text(json.dumps(record))
+        api = self.api(current=True)
+        with patch.object(catalog, 'make_hub_api', return_value=api):
+            self.cli('--check-upstream', '--stdout')
+        self.assertEqual(api.model_info.call_args.kwargs['revision'], 'main')
+
+    def test_upstream_pinned_sha_uses_main_fallback(self):
+        source = self.model()
+        (source / 'archive-provenance/download-test.json').write_text(json.dumps({
+            'repository': 'owner/model', 'repository_commit': COMMIT, 'requested_revision': COMMIT}))
+        api = self.api(current=True)
+        with patch.object(catalog, 'make_hub_api', return_value=api):
+            text = self.cli('--check-upstream', '--stdout')
+        self.assertIn('main fallback', text)
+        self.assertEqual(api.model_info.call_args.kwargs['revision'], 'main')
+
+    def test_upstream_source_endpoint_mismatch_does_not_send_requests(self):
+        source = self.model()
+        (source / 'archive-provenance/download-test.json').write_text(json.dumps({
+            'repository': 'owner/model', 'repository_commit': COMMIT, 'requested_revision': 'main',
+            'source_url': 'https://different.example/owner/model'}))
+        api = self.api()
+        with patch.object(catalog, 'make_hub_api', return_value=api):
+            text = self.cli('--check-upstream', '--stdout')
+        self.assertIn('comparison was skipped', text)
+        api.model_info.assert_not_called()
+
+    def test_upstream_conversion_compares_source_selection(self):
+        source = self.model(layout='inference/gguf', artifact='q4')
+        (source / 'archive-provenance/source-snapshot.json').write_text(json.dumps({
+            'files': {'model.safetensors': 'b' * 64}}))
+        api = self.api()
+        with patch.object(catalog, 'make_hub_api', return_value=api):
+            text = self.cli('--check-upstream', '--stdout')
+        self.assertIn('Source checkpoint for local conversion', text)
+        self.assertIn('| model.safetensors | modified | Weights/indexes | Yes |', text)
+        self.assertIn('main fallback', text)
+
+    def test_upstream_unsealed_download_not_compared(self):
+        source = self.model()
+        (source / catalog.SNAPSHOT).unlink()
+        api = self.api()
+        with patch.object(catalog, 'make_hub_api', return_value=api):
+            text = self.cli('--check-upstream', '--stdout')
+        self.assertIn('No sealed revision', text)
+        api.model_info.assert_not_called()
+
+    def test_upstream_missing_dependency_preserves_catalog(self):
+        self.model()
+        self.cli()
+        output = self.local / 'MODEL-CATALOG.md'
+        before = output.read_bytes()
+        with patch.object(catalog, 'make_hub_api', side_effect=ValueError('Missing SDK')), self.assertRaises(ValueError):
+            self.cli('--check-upstream')
+        self.assertEqual(output.read_bytes(), before)
+
+    def test_upstream_revision_requires_flag(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.cli('--upstream-revision', 'release')
+
+    def test_upstream_commit_advance_with_identical_files(self):
+        self.model()
+        api = self.api()
+        api.list_repo_tree.side_effect = lambda *args, **kwargs: iter([SimpleNamespace(path='README.md', blob_id='same')])
+        with patch.object(catalog, 'make_hub_api', return_value=api):
+            text = self.cli('--check-upstream', '--stdout')
+        self.assertIn('2 commits behind', text)
+        self.assertIn('No repository file differences', text)
+
+    def test_upstream_inconsistent_histories_have_unknown_count(self):
+        self.model()
+        api = self.api()
+        api.list_repo_commits.side_effect = lambda repo, revision: [SimpleNamespace(commit_id=c) for c in
+            (['b' * 40, COMMIT] if revision == 'b' * 40 else [COMMIT, 'f' * 40])]
+        with patch.object(catalog, 'make_hub_api', return_value=api):
+            text = self.cli('--check-upstream', '--stdout')
+        self.assertIn('| Commits behind | Unknown |', text)
+        self.assertNotIn('0 commits behind', text)
+
+    def test_offline_refresh_drops_previous_online_report(self):
+        self.model()
+        with patch.object(catalog, 'make_hub_api', return_value=self.api(current=True)):
+            self.cli('--check-upstream')
+        output = self.local / 'MODEL-CATALOG.md'
+        self.assertIn('Upstream comparison', output.read_text())
+        with patch.object(catalog, 'make_hub_api', side_effect=AssertionError('network access')):
+            self.cli()
+        self.assertNotIn('Upstream comparison', output.read_text())
 
 
 if __name__ == '__main__':

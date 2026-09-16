@@ -10,6 +10,8 @@ are left in place.
 
 Run `./bin/model-catalog` to update a Markdown catalog of local and NAS model
 downloads, or `./bin/model-catalog --local-only` to scan local storage only.
+Add `--check-upstream` to report newer Hugging Face commits and changed-file
+categories (requires the `huggingface_hub` Python package).
 See the [catalog guide](scripts/ai/README.md#markdown-download-catalog) for custom
 roots, mirrored indexes, and read-only previews.
 
