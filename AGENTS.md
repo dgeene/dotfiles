@@ -930,6 +930,36 @@ Do not reorganize the repository merely for aesthetic reasons.
 
 Do not introduce a framework when a small shell or Python script is sufficient.
 
+## Planning sessions and implementation handoffs
+
+After a substantive planning session with an AI about future repository work,
+draft or update a Markdown handoff in `docs/ideas/` before ending the session.
+Use [the handoff template](docs/ideas/TEMPLATE.md) and update
+[the ideas index](docs/ideas/README.md). This is part of the planning workflow;
+do not require a separate request to save the plan when file edits are allowed.
+
+* Use one descriptive, kebab-case filename per idea. Update an existing matching
+  idea instead of creating a duplicate.
+* Record the goal, current behavior and relevant source files, proposed changes,
+  scope, constraints, acceptance criteria, validation, and open questions.
+* Distinguish user decisions from agent recommendations. Preserve unresolved
+  choices as open questions rather than inventing agreement.
+* Start with `proposed`. Use `ready` when the plan is actionable; this status
+  does not itself authorize implementation. Keep the status and last-reviewed
+  date current in both the handoff and index.
+* Store portable implementation context, not conversation transcripts, secrets,
+  machine-specific settings, or model artifacts.
+* Respect explicit read-only requests and modes that prohibit file changes.
+  In those cases, provide the handoff draft in the response instead of writing
+  files, and state that it has not been saved.
+
+An idea document is context, not an instruction to execute its proposed work.
+When assigned an idea, inspect the current code and revalidate its assumptions.
+Proceed within the user's existing authorization; do not ask again merely
+because the work originated in an idea document. After implementation and
+validation, mark it `implemented` and summarize the result. Mark replaced plans
+`superseded` and link their replacements. Update the index with either change.
+
 ---
 
 # Bootstrap Workflow
