@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Convert one screen recording to a looping GIF using FFmpeg."""
+
+import argparse
+import math
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+def seconds(value):
+    try:
+        result = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected a number of seconds')
+    if not math.isfinite(result) or result < 0:
+        raise argparse.ArgumentTypeError('seconds must be finite and nonnegative')
+    return result
+
+
+def positive_int(value):
+    try:
+        result = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected a positive integer')
+    if result < 1:
+        raise argparse.ArgumentTypeError('expected a positive integer')
+    return result
+
+
+def commands(source, temporary, args):
+    common = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-n', '-xerror']
+    # Both passes decode exactly the same interval. Input seeking still uses
+    # FFmpeg's accurate seek when transcoding (rather than copying keyframes).
+    video = ['-ss', str(args.start)]
+    if args.duration is not None:
+        video += ['-t', str(args.duration)]
+    video += ['-i', str(source)]
+    # Account for non-square input pixels, preserve display aspect ratio, and
+    # normalize the output to square pixels. FFmpeg autorotates phone recordings.
+    resize = (f'fps={args.fps},scale=w=\'min({args.width},iw*sar)\':'
+              'h=\'max(1,round(ih*ow/(iw*sar)))\':flags=lanczos,setsar=1')
+    palette = temporary / 'palette.png'
+    pending = temporary / 'output.gif'
+    generate = common + video + [
+        '-map', '0:v:0', '-an', '-sn', '-dn', '-filter_threads', '1',
+        '-vf', resize + ',palettegen=stats_mode=full',
+        '-frames:v', '1', '-update', '1', str(palette)]
+    encode = common + video + ['-i', str(palette), '-filter_complex_threads', '1',
+        '-filter_complex', f'[0:v:0]{resize}[video];'
+        '[video][1:v:0]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle[out]',
+        '-map', '[out]', '-an', '-sn', '-dn', '-map_metadata', '-1',
+        '-loop', '0', str(pending)]
+    # Ignore the GIF loop extension during verification so decoding terminates.
+    verify = common + ['-ignore_loop', '1', '-i', str(pending), '-map', '0:v:0',
+                       '-f', 'null', '-']
+    return generate, encode, verify
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog='Requires Python 3.8+ and ffmpeg on PATH (Linux/macOS). Accepts MOV, '
+               'MP4, and other FFmpeg-readable videos. The source is left unchanged. '
+               'GIFs have no audio and limited colors; file size is not guaranteed. '
+               'By default the full video is converted and loops forever.')
+    parser.add_argument('video', type=Path, help='one input video')
+    parser.add_argument('-o', '--output', type=Path, help='output .gif (default: beside video, same stem)')
+    parser.add_argument('--start', type=seconds, default=0, metavar='SECONDS',
+                        help='start offset in seconds, including decimals (default: 0)')
+    parser.add_argument('--duration', type=seconds, metavar='SECONDS',
+                        help='seconds to convert after start (default: to end)')
+    parser.add_argument('--width', type=positive_int, default=960,
+                        help='maximum display width in pixels, no upscaling (default: 960)')
+    parser.add_argument('--fps', type=positive_int, default=10,
+                        help='frames per second, 1–50 (default: 10)')
+    parser.add_argument('-n', '--dry-run', action='store_true',
+                        help='show paths and FFmpeg commands without writing files')
+    args = parser.parse_args()
+    if args.duration == 0:
+        parser.error('--duration must be greater than zero')
+    if args.fps > 50:
+        parser.error('--fps must be between 1 and 50')
+    source = args.video.expanduser().absolute()
+    if not source.is_file():
+        parser.error(f'Not a video file: {source}')
+    output = (args.output.expanduser().absolute() if args.output else source.with_suffix('.gif'))
+    if output.suffix.lower() != '.gif':
+        parser.error('--output must end in .gif')
+    if os.path.lexists(output):
+        parser.error(f'Output already exists; choose another name with --output: {output}')
+    if not output.parent.is_dir():
+        parser.error(f'Output directory does not exist: {output.parent}')
+    if not args.dry_run and not shutil.which('ffmpeg'):
+        parser.error('ffmpeg is required but was not found on PATH')
+    print(f'{source} -> {output}', flush=True)
+    if args.dry_run:
+        for command in commands(source, output.parent / '.video-to-gif-PREVIEW', args):
+            print(shlex.join(command))
+        return 0
+
+    before = source.stat()
+    # Two passes avoid buffering the entire recording while waiting for a palette.
+    with tempfile.TemporaryDirectory(prefix='.video-to-gif-', dir=output.parent) as directory:
+        temporary = Path(directory)
+        generate, encode, verify = commands(source, temporary, args)
+        print('Generating palette...', flush=True)
+        subprocess.run(generate, check=True)
+        if not (temporary / 'palette.png').is_file():
+            raise ValueError('No video frames found; check --start and --duration')
+        print('Encoding GIF...', flush=True)
+        subprocess.run(encode, check=True)
+        pending = temporary / 'output.gif'
+        if not pending.is_file() or pending.stat().st_size == 0:
+            raise ValueError('FFmpeg produced no GIF')
+        subprocess.run(verify, check=True)
+        after = source.stat()
+        if any(getattr(before, field) != getattr(after, field)
+               for field in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')):
+            raise ValueError('Source changed during conversion; rerun once recording has finished')
+        # Publish the verified result without replacing a destination created
+        # during conversion. Temporary output shares the destination filesystem.
+        os.link(pending, output)
+    print(f'Created {output} ({output.stat().st_size / (1024 * 1024):.2f} MiB). Source unchanged.')
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f'ERROR: {error}', file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

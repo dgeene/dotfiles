@@ -42,6 +42,47 @@ is moved. Failures leave originals in place, are reported, and produce a nonzero
 exit status while other images continue. The filesystem must support hard links
 for safe publication and archival without overwriting files.
 
+## Video to GIF
+
+`video-to-gif` converts one MOV, MP4, or other FFmpeg-readable video into a looping
+GIF for app demos. Defaults: maximum width **960 pixels**, **10 fps**, full video
+duration, and output beside the source with a `.gif` extension. It preserves the
+display aspect ratio without upscaling and honors video rotation metadata.
+Sources stay unchanged; existing outputs are refused. Requires Python 3.8+ and
+`ffmpeg` on PATH on Linux/macOS, with no additional Python packages.
+
+Install once from your dotfiles checkout:
+
+```sh
+mkdir -p "$HOME/.local/bin"
+ln -s "$PWD/bin/video-to-gif" "$HOME/.local/bin/video-to-gif"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Keep the PATH line in your `~/.bashrc` or `~/.zshrc` if not already configured.
+Then run from wherever your recordings are stored:
+
+```sh
+video-to-gif "Screen Recording.mov"
+video-to-gif demo.mp4 --start 2.5 --duration 8 -o feature-demo.gif
+video-to-gif demo.mov --width 720 --fps 8  # reduce size
+video-to-gif demo.mov --dry-run           # show commands without writing files
+video-to-gif --help
+```
+
+`--start` and `--duration` accept seconds, including decimals. Duration is measured
+from the start offset. To use an input filename beginning with `-`, place `--`
+before its name. Custom output directories must already exist.
+
+Conversion uses two FFmpeg passes to generate and apply a color palette, then
+decodes the GIF to verify it before publishing. Temporary files are created beside
+the output and cleaned up on success or failure. Safe publication requires a
+filesystem with hard-link support. GIFs loop continuously, have no audio, and
+have limited colors; gradients and fine text may lose detail. Size depends on the
+recording; trimming duration usually helps most, followed by reducing width or fps.
+No upload-size limit is enforced. Upload the resulting GIF as an attachment in
+your pull request or Confluence page; the command performs no uploads.
+
 Model archives preserve immutable repository revisions, verified NAS/backup
 copies, and separate GGUF conversions with reproducible recipe records using
 [archive-hf-model](scripts/ai/README.md). Optional tar archives include content
