@@ -1,5 +1,47 @@
 # Dotfiles
 
+## PNG to JPEG
+
+`png-to-jpeg` converts PNG images in the current directory **and subdirectories**
+using FFmpeg, then moves each original into a `PNG/` folder beside that image.
+It preserves dimensions, composites transparency over white, and defaults to
+high-quality JPEG (`-q:v 2`, 4:4:4 color). JPEG is lossy and is not always smaller;
+originals are retained unchanged. Keeping originals also means total disk usage
+increases. Metadata and color profiles are not guaranteed to survive conversion;
+animated PNGs produce a JPEG of their first frame only.
+
+Requires Python 3.8+ and `ffmpeg` on PATH; supports Linux and macOS. Install FFmpeg
+with your system's package manager if needed. No Python packages are required.
+
+From your dotfiles checkout, install the command once (an existing destination
+will not be overwritten):
+
+```sh
+mkdir -p "$HOME/.local/bin"
+ln -s "$PWD/bin/png-to-jpeg" "$HOME/.local/bin/png-to-jpeg"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Add the `export PATH` line to your `~/.bashrc` or `~/.zshrc` if it is not already
+configured. Then run from any image directory:
+
+```sh
+png-to-jpeg --dry-run          # preview conversion and original destinations
+png-to-jpeg                    # convert this directory and subdirectories
+png-to-jpeg --no-recursive     # only this directory
+png-to-jpeg --quality 4        # smaller files, more compression (1–31; lower is better)
+png-to-jpeg /path/to/images    # optionally specify a directory
+png-to-jpeg --help
+```
+
+Matching is case-insensitive for `.png` extensions and includes hidden files.
+Archive directories named `PNG` (any capitalization) and symlinks are excluded
+from recursive scans. Existing JPEG names or archived originals are skipped;
+files are never overwritten. Each JPEG is decoded to check it before its original
+is moved. Failures leave originals in place, are reported, and produce a nonzero
+exit status while other images continue. The filesystem must support hard links
+for safe publication and archival without overwriting files.
+
 Model archives preserve immutable repository revisions, verified NAS/backup
 copies, and separate GGUF conversions with reproducible recipe records using
 [archive-hf-model](scripts/ai/README.md). Optional tar archives include content

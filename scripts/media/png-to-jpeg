@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Convert PNGs recursively to high-quality JPEGs and archive originals locally."""
+
+import argparse
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+# Build an opaque white background of exactly the input dimensions, then composite
+# in RGB before encoding with full chroma resolution.
+FILTER = (
+    '[0:v]format=rgba,split[fg][bg];'
+    '[bg]lutrgb=r=255:g=255:b=255:a=255[white];'
+    '[white][fg]overlay=format=rgb:shortest=1,format=yuvj444p[out]'
+)
+
+
+def exists(path):
+    return os.path.lexists(path)
+
+
+def candidates(root, recursive):
+    def onerror(error):
+        raise error
+    for directory, dirs, files in os.walk(root, followlinks=False, onerror=onerror):
+        parent = Path(directory)
+        dirs[:] = sorted(d for d in dirs if recursive and d.lower() != 'png'
+                         and not (parent / d).is_symlink())
+        for name in sorted(files):
+            path = parent / name
+            if path.suffix.lower() == '.png' and path.is_file() and not path.is_symlink():
+                yield path
+
+
+def convert(source, quality, dry_run):
+    output = source.with_suffix('.jpg')
+    archive = source.parent / 'PNG'
+    original = archive / source.name
+    if archive.is_symlink() or (exists(archive) and not archive.is_dir()):
+        raise ValueError(f'Archive must be a real directory: {archive}')
+    # Treat all common JPEG suffixes/capitalizations as conflicts.
+    conflicts = [p for p in source.parent.iterdir()
+                 if p.stem.casefold() == source.stem.casefold()
+                 and p.suffix.lower() in ('.jpg', '.jpeg')]
+    if conflicts or exists(original):
+        print(f'SKIP (destination exists): {source}')
+        return 'skipped'
+    if dry_run:
+        print(f'WOULD CONVERT {source} -> {output}; move original -> {original}')
+        return 'planned'
+
+    before = source.stat()
+    with tempfile.TemporaryDirectory(prefix='.png-to-jpeg-', dir=source.parent) as temporary:
+        pending = Path(temporary) / 'image.jpg'
+        subprocess.run([
+            'ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-n',
+            '-xerror', '-i', str(source), '-filter_complex_threads', '1',
+            '-filter_complex', FILTER, '-map', '[out]', '-frames:v', '1',
+            '-c:v', 'mjpeg', '-q:v', str(quality), '-pix_fmt', 'yuvj444p',
+            '-update', '1', str(pending),
+        ], check=True)
+        if not pending.is_file() or pending.stat().st_size == 0:
+            raise ValueError(f'FFmpeg produced no JPEG for {source}')
+        subprocess.run([
+            'ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin',
+            '-xerror', '-i', str(pending), '-f', 'null', '-',
+        ], check=True)
+        after = source.stat()
+        if source.is_symlink() or any(getattr(after, field) != getattr(before, field)
+                                     for field in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')):
+            raise ValueError(f'Source changed during conversion; leaving it in place: {source}')
+        archive.mkdir(exist_ok=True)
+        if archive.is_symlink():
+            raise ValueError(f'Refusing symlink archive: {archive}')
+        # Exclusive hard links cannot overwrite existing destinations. Both files
+        # are on the same filesystem as their respective targets. If archiving
+        # fails, leave the JPEG and original in place for manual inspection.
+        os.link(pending, output)
+        os.link(source, original)
+        source.unlink()
+        size = output.stat().st_size
+    print(f'CONVERTED {source} -> {output} ({before.st_size:,} -> {size:,} bytes); '
+          f'original -> {original}')
+    if size >= before.st_size:
+        print(f'NOTE: JPEG is not smaller: {output}')
+    return 'converted'
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog='Requires Python 3.8+ and ffmpeg on PATH (Linux/macOS). JPEG is lossy; '
+               'size reduction is not guaranteed. Transparency becomes white; dimensions '
+               'are preserved. Only the first frame of animated PNGs is converted. '
+               'Metadata/color profiles are not guaranteed to survive; originals remain '
+               'in each directory\'s PNG/ folder. Existing destinations and symlinks '
+               'are skipped; PNG/ directories are excluded from recursion.')
+    parser.add_argument('directory', nargs='?', type=Path, default=Path('.'),
+                        help='directory to scan (default: current directory, recursively)')
+    parser.add_argument('-q', '--quality', type=int, choices=range(1, 32), default=2,
+                        metavar='1-31', help='FFmpeg JPEG quality: lower is better (default: 2)')
+    parser.add_argument('--no-recursive', action='store_true', help='process only this directory')
+    parser.add_argument('-n', '--dry-run', action='store_true', help='preview without changing files')
+    args = parser.parse_args()
+    root = args.directory.expanduser().resolve()
+    if not root.is_dir():
+        parser.error(f'Not a directory: {root}')
+    if not args.dry_run and not shutil.which('ffmpeg'):
+        parser.error('ffmpeg is required but was not found on PATH')
+    counts = dict(converted=0, planned=0, skipped=0, failed=0)
+    # Snapshot the input list before creating any archive or temporary directories.
+    for source in list(candidates(root, not args.no_recursive)):
+        try:
+            counts[convert(source, args.quality, args.dry_run)] += 1
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            counts['failed'] += 1
+            print(f'ERROR: {source}: {error}', file=sys.stderr)
+    print('Summary: ' + ', '.join(f'{value} {key}' for key, value in counts.items()))
+    return 1 if counts['failed'] else 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except OSError as error:
+        print(f'ERROR: {error}', file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
