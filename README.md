@@ -1,5 +1,8 @@
 # Dotfiles
 
+Media commands include `png-to-jpeg`, `video-to-gif`, and `video-to-mp4` for
+converting legacy videos to browser-friendly MP4 files for copyparty. See the
+[media guide](scripts/media/README.md) for installation, usage, and GPU options.
 
 Model archives preserve immutable repository revisions, verified NAS/backup
 copies, and separate GGUF conversions with reproducible recipe records using
