@@ -2,6 +2,7 @@
 """Convert legacy videos to browser-friendly H.264/AAC fast-start MP4 files."""
 
 import argparse
+import errno
 import json
 import os
 from pathlib import Path
@@ -18,10 +19,34 @@ EXTENSIONS = {'.flv', '.webm', '.avi', '.wmv', '.asf', '.wma', '.mp4', '.m4v',
 BASE = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-n', '-xerror']
 
 
-def probe(path):
-    result = subprocess.run(['ffprobe', '-v', 'error', '-show_streams', '-of', 'json',
+def probe(path, details=False):
+    result = subprocess.run(['ffprobe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json',
                              str(path)], check=True, capture_output=True, text=True)
-    return json.loads(result.stdout)['streams']
+    data = json.loads(result.stdout)
+    return data if details else data['streams']
+
+
+def browser_friendly_mp4(path):
+    """Conservative codec check, not a full integrity or device playback test."""
+    if path.suffix.lower() != '.mp4':
+        return False
+    data = probe(path, details=True)
+    if 'mp4' not in data.get('format', {}).get('format_name', '').split(','):
+        return False
+    streams = data['streams']
+    videos = [s for s in streams if s['codec_type'] == 'video'
+              and not s.get('disposition', {}).get('attached_pic')]
+    audios = [s for s in streams if s['codec_type'] == 'audio']
+    return bool(videos) and all(
+        s.get('codec_name') == 'h264'
+        and s.get('codec_tag_string') == 'avc1'
+        and s.get('profile') in ('Constrained Baseline', 'Baseline', 'Main', 'High')
+        and s.get('pix_fmt') == 'yuv420p'
+        and s.get('field_order') in (None, 'unknown', 'progressive')
+        and s.get('color_transfer') not in ('smpte2084', 'arib-std-b67')
+        for s in videos
+    ) and all(s.get('codec_name') == 'aac' and s.get('profile') == 'LC'
+              and s.get('channels') in (1, 2) for s in audios)
 
 
 def streams_for(path):
@@ -47,12 +72,59 @@ def inputs(path, recursive):
     for directory, dirs, files in os.walk(path, followlinks=False, onerror=onerror):
         parent = Path(directory)
         dirs[:] = sorted(d for d in dirs if recursive and not d.startswith('.video-to-mp4-')
+                         and d.lower() != 'originals'
                          and not (parent / d).is_symlink())
         found.extend(parent / name for name in sorted(files)
                      if Path(name).suffix.lower() in EXTENSIONS
                      and not name.lower().endswith('.web.mp4')
                      and not (parent / name).is_symlink())
     return found
+
+
+def archive_destination(source):
+    directory = source.parent / 'originals'
+    if directory.is_symlink() or (os.path.lexists(directory) and not directory.is_dir()):
+        raise ValueError(f'Archive must be a real directory: {directory}')
+    destination = directory / source.name
+    if os.path.lexists(destination):
+        raise ValueError(f'Archived original already exists: {destination}')
+    return destination
+
+
+def archive_original(source, destination, before):
+    """Move without overwriting; retry sharing/permission failures interactively."""
+    linked = False
+    while True:
+        try:
+            if destination.parent.is_symlink():
+                raise ValueError(f'Refusing symlink archive: {destination.parent}')
+            after = source.stat()
+            # Creating a hard link changes ctime, so it cannot be compared here.
+            if source.is_symlink() or any(getattr(before, field) != getattr(after, field)
+                                         for field in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns')):
+                raise ValueError('Source changed before archival; leaving it in place')
+            destination.parent.mkdir(exist_ok=True)
+            if not linked:
+                os.link(source, destination)
+                linked = True
+            if destination.is_symlink() or not os.path.samefile(source, destination):
+                raise ValueError('Archive destination changed; leaving source in place')
+            source.unlink()
+            return
+        except OSError as error:
+            if (error.errno not in (errno.EACCES, errno.EPERM, errno.EBUSY, errno.ETXTBSY)
+                    and getattr(error, 'winerror', None) not in (32, 33)):
+                raise
+            print(f'Cannot move {source} into {destination.parent}: {error}\n'
+                  'Close any application using the file (or correct directory permissions). '
+                  'The converted MP4 is already saved.', file=sys.stderr, flush=True)
+            if not sys.stdin.isatty():
+                raise RuntimeError('Archival paused but no interactive terminal is available; '
+                                   'source retained. Move it manually after resolving the error.') from error
+            try:
+                input('Press Enter to retry moving the original, or Ctrl-C to stop: ')
+            except EOFError:
+                raise RuntimeError('Input closed while waiting; source retained') from error
 
 
 def amd_device(requested):
@@ -130,8 +202,9 @@ def verify(path, video, audio):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, epilog=
-        'Requires Python 3.8+, ffmpeg and ffprobe. Originals stay unchanged. '
-        'Directory scans skip symlinks and *.web.mp4. Existing outputs are skipped. '
+        'Requires Python 3.8+, ffmpeg and ffprobe. Originals move into originals/ after conversion. '
+        'Directory scans skip originals/ folders, symlinks and *.web.mp4. Existing outputs are skipped. '
+        'Browser-friendly MP4s are left in place unless --force-convert is set. '
         'Only the first video and audio streams are retained; subtitles are omitted.')
     parser.add_argument('path', nargs='?', type=Path, default=Path('.'),
                         help='file or directory (default: current directory)')
@@ -146,6 +219,8 @@ def main():
     parser.add_argument('--audio-bitrate', type=int, default=160, metavar='KBPS',
                         help='stereo AAC bitrate (default: 160)')
     parser.add_argument('--deinterlace', action='store_true', help='deinterlace old interlaced recordings')
+    parser.add_argument('--force-convert', action='store_true',
+                        help='convert even browser-friendly MP4s; never overwrite existing outputs')
     parser.add_argument('-n', '--dry-run', action='store_true', help='probe inputs and print commands; write nothing')
     args = parser.parse_args()
     if not 32 <= args.audio_bitrate <= 512:
@@ -169,12 +244,19 @@ def main():
         try:
             if output == path or output.suffix.lower() != '.mp4':
                 raise ValueError('Output must be a separate .mp4 path')
+            if path.is_symlink():
+                raise ValueError(f'Refusing symlink source: {path}')
+            if not args.force_convert and not args.deinterlace and browser_friendly_mp4(path):
+                print(f'SKIP (already browser-friendly MP4; original left in place): {path}')
+                counts['skipped'] += 1
+                continue
             if os.path.lexists(output):
                 print(f'SKIP (destination exists): {output}')
                 counts['skipped'] += 1
                 continue
             if not output.parent.is_dir():
                 raise ValueError(f'Output directory does not exist: {output.parent}')
+            archived = archive_destination(path)
             before = path.stat()
             video, audio = streams_for(path)
             if video and encoder is None:
@@ -193,6 +275,7 @@ def main():
                 print('NOTE: audio-only input; creating AAC audio in MP4.')
             if args.dry_run:
                 print(shlex.join(command(path, output, video, audio, args, selected)))
+                print(f'WOULD MOVE {path} -> {archived}')
                 counts['planned'] += 1
                 continue
             with tempfile.TemporaryDirectory(prefix='.video-to-mp4-', dir=output.parent) as directory:
@@ -205,6 +288,8 @@ def main():
                     raise ValueError('Source changed during conversion; output not published')
                 # Atomic no-clobber publication on the destination filesystem.
                 os.link(pending, output)
+            print(f'MP4 saved; moving original to {archived}', flush=True)
+            archive_original(path, archived, before)
             counts['converted'] += 1
             print(f'Created {output} ({output.stat().st_size / 1048576:.2f} MiB)', flush=True)
         except (OSError, ValueError, subprocess.CalledProcessError) as error:

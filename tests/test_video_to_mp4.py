@@ -1,5 +1,6 @@
 """Real FFmpeg integration tests plus GPU command tests (no GPU required)."""
 import argparse
+import errno
 from fractions import Fraction
 import hashlib
 import json
@@ -60,7 +61,8 @@ class ConversionTests(unittest.TestCase):
                     self.assertEqual(streams[1]['channels'], 2)
                 data = output.read_bytes()
                 self.assertLess(data.index(b'moov'), data.index(b'mdat'))
-                self.assertEqual(hashlib.sha256(source.read_bytes()).digest(), before)
+                self.assertFalse(source.exists())
+                self.assertEqual(hashlib.sha256((source.parent / 'originals' / source.name).read_bytes()).digest(), before)
 
     def test_odd_dimensions_and_display_aspect(self):
         source = self.fixture('odd.mkv', 'ffv1', size='95x63', sar='4/3', audio=False)
@@ -68,6 +70,48 @@ class ConversionTests(unittest.TestCase):
         video = self.probe(self.root / 'odd.web.mp4')[0]
         self.assertEqual((video['width'], video['height']), (96, 64))
         self.assertEqual(Fraction(video['display_aspect_ratio'].replace(':', '/')), Fraction(95 * 4, 63 * 3))
+
+    def compatible_fixture(self, name='compatible.mp4', audio=True, audio_codec='aac'):
+        path = self.root / name
+        cmd = ['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+               'testsrc2=size=96x64:rate=10:duration=0.4']
+        if audio:
+            cmd += ['-f', 'lavfi', '-i', 'sine=duration=0.4', '-c:a', audio_codec]
+        subprocess.run(cmd + ['-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                             '-threads', '1', str(path)], check=True)
+        return path
+
+    def test_compatible_mp4_skipped_without_archival_or_gpu_initialization(self):
+        source = self.compatible_fixture()
+        before = source.read_bytes()
+        for extra in [[], ['--dry-run'], ['--encoder', 'nvidia']]:
+            result = self.cli(source, *extra)
+            self.assertIn('already browser-friendly MP4', result.stdout)
+            self.assertIn('1 skipped', result.stdout)
+            self.assertEqual(list(self.root.iterdir()), [source])
+            self.assertEqual(source.read_bytes(), before)
+
+    def test_silent_compatible_mp4_and_force_conversion(self):
+        source = self.compatible_fixture('silent.MP4', audio=False)
+        self.assertIn('1 skipped', self.cli(source).stdout)
+        self.assertIn('1 converted', self.cli(source, '--force-convert').stdout)
+        self.assertFalse(source.exists())
+        self.assertTrue((self.root / 'originals/silent.MP4').is_file())
+        self.assertTrue((self.root / 'silent.web.mp4').is_file())
+
+    def test_incompatible_mp4_video_and_audio_still_converted(self):
+        for source in [self.fixture('mpeg4.mp4'),
+                       self.compatible_fixture('alac.mp4', audio_codec='alac')]:
+            with self.subTest(source=source.name):
+                self.assertIn('1 converted', self.cli(source).stdout)
+                self.assertFalse(source.exists())
+                self.assertTrue((self.root / 'originals' / source.name).is_file())
+
+    def test_deinterlace_bypasses_compatible_skip(self):
+        source = self.compatible_fixture(audio=False)
+        result = self.cli(source, '--deinterlace', '--dry-run')
+        self.assertIn('1 planned', result.stdout)
+        self.assertIn('bwdif', result.stdout)
 
     def test_batch_preview_recursion_collisions_and_failures(self):
         source = self.fixture('top.avi')
@@ -80,7 +124,8 @@ class ConversionTests(unittest.TestCase):
         self.cli('-r')
         output = nested / 'top.web.mp4'
         before = output.read_bytes()
-        self.assertIn('1 skipped', self.cli('-r').stdout)
+        self.assertIn('0 converted', self.cli('-r').stdout)
+        self.assertTrue((nested / 'originals/top.avi').is_file())
         self.assertEqual(output.read_bytes(), before)
         bad = self.root / 'bad.wmv'
         bad.write_bytes(b'broken video')
@@ -99,7 +144,7 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(streams[0]['codec_name'], 'aac')
         target = self.root / 'occupied.mp4'
         target.symlink_to('missing')
-        self.assertIn('1 skipped', self.cli(source, '-o', target).stdout)
+        self.assertIn('1 skipped', self.cli(self.root / 'originals/sound.wma', '-o', target).stdout)
         self.assertTrue(target.is_symlink())
 
     def test_rotation_and_custom_output(self):
@@ -114,6 +159,58 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual((video['width'], video['height']), (64, 96))
         self.assertFalse(any(data.get('rotation', 0)
                              for data in video.get('side_data_list', [])))
+
+
+class ArchiveTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.source = Path(self.temp.name) / 'video.avi'
+        self.source.write_bytes(b'original bytes')
+        self.before = self.source.stat()
+        self.destination = MODULE['archive_destination'](self.source)
+
+    def test_locked_unlink_retries_without_reencoding(self):
+        unlink = Path.unlink
+        attempts = []
+        def locked_once(path, *args, **kwargs):
+            if path == self.source:
+                attempts.append(path)
+                if len(attempts) == 1:
+                    raise PermissionError(errno.EACCES, 'file locked')
+            return unlink(path, *args, **kwargs)
+        with patch.object(Path, 'unlink', locked_once), patch('sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', return_value='') as prompt:
+            MODULE['archive_original'](self.source, self.destination, self.before)
+        prompt.assert_called_once()
+        self.assertEqual(len(attempts), 2)
+        self.assertFalse(self.source.exists())
+        self.assertEqual(self.destination.read_bytes(), b'original bytes')
+
+    def test_collision_never_overwrites(self):
+        self.destination.parent.mkdir()
+        self.destination.write_bytes(b'existing original')
+        with self.assertRaises(ValueError):
+            MODULE['archive_destination'](self.source)
+        with self.assertRaises(FileExistsError):
+            MODULE['archive_original'](self.source, self.destination, self.before)
+        self.assertEqual(self.destination.read_bytes(), b'existing original')
+        self.assertEqual(self.source.read_bytes(), b'original bytes')
+
+    def test_noninteractive_lock_stops_with_source_retained(self):
+        with patch('os.link', side_effect=OSError(errno.EBUSY, 'busy')), \
+                patch('sys.stdin.isatty', return_value=False):
+            with self.assertRaisesRegex(RuntimeError, 'no interactive terminal'):
+                MODULE['archive_original'](self.source, self.destination, self.before)
+        self.assertEqual(self.source.read_bytes(), b'original bytes')
+
+    def test_symlink_archive_rejected(self):
+        elsewhere = self.source.parent / 'elsewhere'
+        elsewhere.mkdir()
+        self.destination.parent.symlink_to(elsewhere, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            MODULE['archive_destination'](self.source)
+        self.assertEqual(list(elsewhere.iterdir()), [])
 
 
 class EncoderTests(unittest.TestCase):

@@ -84,9 +84,27 @@ your pull request or Confluence page; the command performs no uploads.
 
 `video-to-mp4` converts legacy videos for browser playback through copyparty.
 Run it without arguments to process the current directory, or pass one file.
-Default output is `NAME.web.mp4` beside the source. Originals stay unchanged.
+Default output is `NAME.web.mp4` beside the source. After conversion and verification,
+each source moves into an `originals/` directory beside its original location;
+its contents remain unchanged, even when a custom output location is used.
 Existing destinations are skipped, and directory scans ignore generated
-`*.web.mp4` files and symlinks. Use `--recursive` to include subdirectories.
+`*.web.mp4` files, `originals/` directories (case-insensitive), and symlinks.
+Use `--recursive` to include subdirectories. Existing archived names are reported
+as errors before conversion; originals are never overwritten.
+
+MP4 inputs are inspected before conversion. Files with H.264 (`avc1`, Baseline,
+Constrained Baseline, Main, or High profile), 8-bit 4:2:0 video and AAC-LC mono/stereo
+audio (or no audio) are skipped and **left in place**, without creating output or
+moving them into `originals/`. All non-cover-art video and audio tracks must pass
+the check. Known interlaced or HDR video is not considered eligible. This check
+also applies to dry runs and occurs before GPU initialization.
+
+The check identifies broadly compatible codecs, not file integrity or guaranteed
+playback on every device. Fast-start metadata is not required to skip a file:
+its position affects startup behavior, not codec compatibility. Other containers
+are still converted even if their codecs match. Use `--force-convert` to bypass
+the check when intentionally changing quality or audio settings; `--deinterlace`
+also bypasses it. Neither option permits overwriting existing outputs.
 
 Requires Python 3.8+, FFmpeg with `libx264` and AAC encoding, and `ffprobe`.
 CPU conversion supports Linux and macOS. No Python packages are required.
@@ -111,6 +129,7 @@ video-to-mp4 movie.flv -q 18 --preset slow
 video-to-mp4 movie.webm --encoder nvidia
 video-to-mp4 movie.wmv --encoder amd
 video-to-mp4 movie.avi --deinterlace
+video-to-mp4 movie.mp4 --force-convert -q 24  # intentionally re-encode
 video-to-mp4 --help
 ```
 
@@ -141,7 +160,7 @@ CPU defaults are `libx264`, CRF 20, and the `medium` preset. `--quality 1–51`
 controls quality (lower means better/larger); `--preset slow` trades CPU time for
 compression efficiency. `--audio-bitrate 192` changes the stereo bitrate in kbps.
 GPU quality uses NVENC CQ or VA-API QP; these numbers are not directly equivalent
-to CPU CRF. All modes re-encode and are lossy; file size may increase. This tool
+to CPU CRF. Files that are not skipped are re-encoded lossily; size may increase. This tool
 targets SDR recordings and rejects detected HDR inputs rather than producing an
 incorrect SDR conversion. It does not downscale very large videos to meet older
 device limits, and cannot guarantee playback on every browser/device.
@@ -170,11 +189,23 @@ do not initialize or test GPU encoders. `--preset` is CPU-only.
 Each conversion uses temporary storage beside its destination. The result is
 probed for expected codecs and fully decoded before it is published without
 overwriting an existing file. This verification adds a decoding pass. Publication
-requires hard-link support on the destination filesystem. Errors leave originals
-unchanged, temporary files are cleaned up, and batch processing continues after
+requires hard-link support on the destination filesystem. Archival also requires
+hard-link support, with `originals/` on the source filesystem. Conversion errors
+leave originals in place, temporary files are cleaned up, and batch processing continues after
 individual file failures with a nonzero final exit status. An encoder availability
 failure stops the run. Interrupted runs may leave temporary directories after a
 forced kill; directory scans exclude those directories.
+
+If a lock or permission error prevents moving an original, the batch pauses.
+Close the application using the file (or correct permissions), then press Enter
+to retry without re-encoding. Ctrl-C stops the run. Linux normally allows moving
+an open file, so merely having a player open does not necessarily trigger a pause.
+Without an interactive terminal, a blocked move stops the script with an error
+instead of waiting for input. The completed MP4 and source are retained. If linking
+into `originals/` succeeded but removing the old name was blocked, both source names
+remain until retry succeeds; they refer to the same file, not two separate copies.
+After an interrupted or failed archive, finish the move manually: reruns still skip
+existing MP4s and do not assume they are verified conversions of the current source.
 
 Place the resulting `.web.mp4` files in the directory served by copyparty, or run
 the converter there. The command does not upload files or change server settings.
