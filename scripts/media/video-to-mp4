@@ -172,6 +172,8 @@ def command(source, output, video, audio, args, encoder):
     if audio:
         cmd += ['-map', f'0:{audio["index"]}', '-c:a', 'aac', '-profile:a', 'aac_low',
                 '-b:a', f'{args.audio_bitrate}k', '-ac', '2', '-ar', '48000']
+        if args.repair_audio_timing:
+            cmd += ['-af', 'aresample=48000:async=1:first_pts=0']
     else:
         cmd += ['-an']
     return cmd + ['-sn', '-dn', '-map_metadata', '-1', '-map_chapters', '-1',
@@ -219,6 +221,8 @@ def main():
     parser.add_argument('--audio-bitrate', type=int, default=160, metavar='KBPS',
                         help='stereo AAC bitrate (default: 160)')
     parser.add_argument('--deinterlace', action='store_true', help='deinterlace old interlaced recordings')
+    parser.add_argument('--repair-audio-timing', action='store_true',
+                        help='reconcile audio timestamp overlaps/gaps by trimming/filling samples (opt-in)')
     parser.add_argument('--force-convert', action='store_true',
                         help='convert even browser-friendly MP4s; never overwrite existing outputs')
     parser.add_argument('-n', '--dry-run', action='store_true', help='probe inputs and print commands; write nothing')
@@ -246,7 +250,8 @@ def main():
                 raise ValueError('Output must be a separate .mp4 path')
             if path.is_symlink():
                 raise ValueError(f'Refusing symlink source: {path}')
-            if not args.force_convert and not args.deinterlace and browser_friendly_mp4(path):
+            if (not args.force_convert and not args.deinterlace and not args.repair_audio_timing
+                    and browser_friendly_mp4(path)):
                 print(f'SKIP (already browser-friendly MP4; original left in place): {path}')
                 counts['skipped'] += 1
                 continue

@@ -113,6 +113,31 @@ class ConversionTests(unittest.TestCase):
         self.assertIn('1 planned', result.stdout)
         self.assertIn('bwdif', result.stdout)
 
+    def test_audio_repair_is_opt_in_and_bypasses_compatible_skip(self):
+        source = self.compatible_fixture()
+        normal = self.cli(source, '--force-convert', '--dry-run')
+        self.assertNotIn('aresample=', normal.stdout)
+        repair = self.cli(source, '--repair-audio-timing', '--dry-run')
+        self.assertIn('1 planned', repair.stdout)
+        self.assertIn('aresample=48000:async=1:first_pts=0', repair.stdout)
+        self.assertTrue(source.exists())
+
+    def test_audio_repair_handles_overlapping_samples(self):
+        source = self.root / 'overlap.mkv'
+        subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+                        'sine=sample_rate=44100:duration=1', '-af',
+                        "asetnsamples=n=4096,asetpts='PTS-if(gte(N,4096),0.04/TB,0)'",
+                        '-c:a', 'pcm_s16le', str(source)], check=True)
+        self.cli(source, '--repair-audio-timing')
+        output = self.root / 'overlap.web.mp4'
+        packets = json.loads(subprocess.check_output([
+            'ffprobe', '-v', 'error', '-select_streams', 'a:0', '-show_packets',
+            '-show_entries', 'packet=dts', '-of', 'json', str(output)]))['packets']
+        times = [p['dts'] for p in packets]
+        self.assertGreater(len(times), 2)
+        self.assertTrue(all(a < b for a, b in zip(times, times[1:])))
+        self.assertTrue((self.root / 'originals/overlap.mkv').exists())
+
     def test_batch_preview_recursion_collisions_and_failures(self):
         source = self.fixture('top.avi')
         nested = self.root / 'nested'
@@ -216,7 +241,7 @@ class ArchiveTests(unittest.TestCase):
 class EncoderTests(unittest.TestCase):
     def args(self, encoder):
         return argparse.Namespace(encoder=encoder, quality=20, preset=None, device=None,
-                                  audio_bitrate=160, deinterlace=False)
+                                  audio_bitrate=160, deinterlace=False, repair_audio_timing=False)
 
     def test_nvidia_and_amd_commands(self):
         args = self.args('nvidia')

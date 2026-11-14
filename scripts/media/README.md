@@ -104,7 +104,7 @@ playback on every device. Fast-start metadata is not required to skip a file:
 its position affects startup behavior, not codec compatibility. Other containers
 are still converted even if their codecs match. Use `--force-convert` to bypass
 the check when intentionally changing quality or audio settings; `--deinterlace`
-also bypasses it. Neither option permits overwriting existing outputs.
+and `--repair-audio-timing` also bypass it. None permits overwriting existing outputs.
 
 Requires Python 3.8+, FFmpeg with `libx264` and AAC encoding, and `ffprobe`.
 CPU conversion supports Linux and macOS. No Python packages are required.
@@ -129,6 +129,7 @@ video-to-mp4 movie.flv -q 18 --preset slow
 video-to-mp4 movie.webm --encoder nvidia
 video-to-mp4 movie.wmv --encoder amd
 video-to-mp4 movie.avi --deinterlace
+video-to-mp4 /path/to/old-recordings --repair-audio-timing
 video-to-mp4 movie.mp4 --force-convert -q 24  # intentionally re-encode
 video-to-mp4 --help
 ```
@@ -149,6 +150,14 @@ video stream and first audio stream are selected; subtitles, other tracks,
 chapters, and source metadata are omitted. Silent videos remain silent;
 audio-only inputs produce audio-only AAC MP4s. WMV is Windows Media Video, while
 WMA is normally Windows Media Audio; actual streams determine the conversion.
+
+For recordings with overlapping or irregular audio timestamps, opt in with
+`--repair-audio-timing`. It adds `aresample=48000:async=1:first_pts=0`, reconciling
+audio samples with timestamps by trimming overlaps or filling gaps and padding/
+trimming the start to timestamp zero. This can alter audio samples; check audible
+sync after conversion. It does not change video frame handling or fix video DTS
+errors. Default audio handling is unchanged. Silent files receive no audio filter.
+The flag works with CPU and GPU encoders and leaves existing outputs untouched.
 
 Even video dimensions stay unchanged. Odd dimensions round up by one pixel to
 meet 4:2:0 requirements; sample aspect ratio is adjusted to preserve the display
