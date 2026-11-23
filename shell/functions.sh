@@ -20,7 +20,7 @@ tmux-attach-or-new() {
         TMUX=""
         tmux -2 new-session -s n"$RANDOM"
     elif [[ ! $(tmux list-sessions) =~ main ]]; then
-        i3-msg 'rename workspace to "1: main"'
+        command -v i3-msg >/dev/null 2>&1 && i3-msg 'rename workspace to "1: main"'
         tmux -2 new-session -s main
     else
         tmux -2 new-session

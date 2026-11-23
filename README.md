@@ -1,5 +1,10 @@
 # Dotfiles
 
+Setup: run `./install.sh --dry-run`, then `./install.sh` (add `--with-shell` to append
+managed blocks to your existing `~/.zshrc`/`~/.zshenv`; nothing is replaced).
+Machine-specific settings go in `~/.config/dotfiles/local.zsh` and `local.zshenv`.
+In Claude Code, ask it to set up the dotfiles or run `/dotfiles-setup`.
+
 Media commands include `png-to-jpeg`, `video-to-gif`, and `video-to-mp4` for
 converting legacy videos to browser-friendly MP4 files for copyparty. See the
 [media guide](scripts/media/README.md) for installation, usage, and GPU options.

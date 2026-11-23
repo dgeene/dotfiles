@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# check-deps - report which commonly needed tools are installed.
+#
+# Purpose:  Read-only dependency report for first-time setup. Installs nothing.
+# Usage:    check-deps [-h|--help]
+# Output:   One line per tool (ok/MISSING), the detected package manager, and
+#           exit status 1 if any required tool is missing.
+set -euo pipefail
+
+case "${1:-}" in
+    -h|--help) sed -n '2,/^set /p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
+    "") ;;
+    *) echo "ERROR: unknown argument: $1" >&2; exit 1 ;;
+esac
+
+required="git curl python3"
+optional="ffmpeg nvim tmux docker"
+
+pm="none"
+for candidate in brew apt-get dnf pacman; do
+    if command -v "$candidate" >/dev/null 2>&1; then pm="$candidate"; break; fi
+done
+echo "Host: $(uname -s) / $(uname -m); package manager: $pm"
+
+missing=0
+for tool in $required; do
+    if command -v "$tool" >/dev/null 2>&1; then echo "  ok       $tool"
+    else echo "  MISSING  $tool (required)"; missing=1; fi
+done
+for tool in $optional; do
+    if command -v "$tool" >/dev/null 2>&1; then echo "  ok       $tool"
+    else echo "  missing  $tool (optional)"; fi
+done
+
+exit "$missing"
