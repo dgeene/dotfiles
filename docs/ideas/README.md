@@ -12,6 +12,8 @@ and add it to this index. Update existing ideas when planning continues.
 | --- | --- | --- | --- |
 | [Automatic catalog refresh](automatic-catalog-refresh.md) | proposed | 2026-09-15 | Refresh the model catalog after successful archive operations. |
 | [Model storage capacity checks](model-storage-capacity-check.md) | proposed | 2026-09-15 | Estimate required disk space before writing model artifacts. |
+| [Move shell credentials into SOPS](sops-shell-secrets.md) | proposed | 2026-11-23 | Replace plaintext credentials in shell startup files with SOPS-encrypted, lazily loaded secrets. |
+| [Finish dot-zshrc and dot-zprofile](finish-dot-zshrc.md) | proposed | 2026-11-23 | Complete the repo zsh config so it can safely replace a machine's existing `~/.zshrc`. |
 
 Status meanings:
 
