@@ -18,4 +18,15 @@ path_append() {
     export PATH
 }
 
+# path_front DIR: put DIR at the very front of PATH, removing any earlier occurrence.
+# Use when something (e.g. macOS path_helper) reorders PATH after startup files ran.
+# Requires bash or zsh.
+path_front() {
+    local p=":$PATH:"
+    while [[ "$p" == *":$1:"* ]]; do p="${p/":$1:"/:}"; done
+    p="${p#:}"; p="${p%:}"
+    PATH="$1${p:+:$p}"
+    export PATH
+}
+
 path_prepend "$HOME/.local/bin"
